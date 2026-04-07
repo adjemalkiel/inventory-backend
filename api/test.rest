@@ -1,0 +1,429 @@
+# VS Code / IntelliJ HTTP Client — run against a running server:
+#   cd inventory-backend && .\env\Scripts\python.exe manage.py runserver
+#
+# DefaultRouter serves collection + detail: GET/POST /api/<resource>/ and GET/PUT/PATCH/DELETE /api/<resource>/<uuid>/
+# Replace @userId if you test user-profiles / user-roles (must exist in auth_user).
+
+@host = http://127.0.0.1:8000
+@api = {{host}}/api
+@userId = 1
+
+###############################################################################
+### API root (route index)
+GET {{api}}/
+Accept: application/json
+
+###############################################################################
+### sites
+GET {{api}}/sites/
+Accept: application/json
+
+### sites — create
+# @name createSite
+POST {{api}}/sites/
+Content-Type: application/json
+
+{
+  "name": "REST Test Site",
+  "code": "RTS"
+}
+
+### sites — detail
+GET {{api}}/sites/{{createSite.response.body.id}}/
+Accept: application/json
+
+### sites — partial update
+PATCH {{api}}/sites/{{createSite.response.body.id}}/
+Content-Type: application/json
+
+{
+  "code": "RTS-UPD"
+}
+
+###############################################################################
+### agencies
+GET {{api}}/agencies/
+Accept: application/json
+
+### agencies — create
+# @name createAgency
+POST {{api}}/agencies/
+Content-Type: application/json
+
+{
+  "name": "REST Test Agency"
+}
+
+### agencies — detail
+GET {{api}}/agencies/{{createAgency.response.body.id}}/
+Accept: application/json
+
+###############################################################################
+### storage-locations
+GET {{api}}/storage-locations/
+Accept: application/json
+
+### storage-locations — create
+# @name createStorage
+POST {{api}}/storage-locations/
+Content-Type: application/json
+
+{
+  "name": "REST Test Warehouse",
+  "storage_type": "depot_principal",
+  "address": "1 Test St",
+  "is_active": true
+}
+
+### storage-locations — detail
+GET {{api}}/storage-locations/{{createStorage.response.body.id}}/
+Accept: application/json
+
+###############################################################################
+### units-of-measure
+GET {{api}}/units-of-measure/
+Accept: application/json
+
+### units-of-measure — create (name must be unique)
+# @name createUnit
+POST {{api}}/units-of-measure/
+Content-Type: application/json
+
+{
+  "name": "REST-Test-Unit"
+}
+
+### units-of-measure — detail
+GET {{api}}/units-of-measure/{{createUnit.response.body.id}}/
+Accept: application/json
+
+###############################################################################
+### categories
+GET {{api}}/categories/
+Accept: application/json
+
+### categories — create
+# @name createCategory
+POST {{api}}/categories/
+Content-Type: application/json
+
+{
+  "name": "REST Test Category"
+}
+
+### categories — detail
+GET {{api}}/categories/{{createCategory.response.body.id}}/
+Accept: application/json
+
+###############################################################################
+### user-profiles (requires valid user pk)
+GET {{api}}/user-profiles/
+Accept: application/json
+
+### user-profiles — create (needs existing User id)
+# @name createUserProfile
+POST {{api}}/user-profiles/
+Content-Type: application/json
+
+{
+  "user": {{userId}},
+  "role": "magasinier",
+  "job_title": "Tester",
+  "site": "{{createSite.response.body.id}}"
+}
+
+### user-profiles — detail
+GET {{api}}/user-profiles/{{createUserProfile.response.body.id}}/
+Accept: application/json
+
+###############################################################################
+### items (needs category + unit)
+GET {{api}}/items/
+Accept: application/json
+
+### items — create
+# @name createItem
+POST {{api}}/items/
+Content-Type: application/json
+
+{
+  "name": "REST Test Item",
+  "sku": "REST-SKU-001",
+  "category": "{{createCategory.response.body.id}}",
+  "unit": "{{createUnit.response.body.id}}",
+  "min_stock": "0",
+  "is_active": true
+}
+
+### items — detail
+GET {{api}}/items/{{createItem.response.body.id}}/
+Accept: application/json
+
+###############################################################################
+### stock-balances (needs item + storage_location)
+GET {{api}}/stock-balances/
+Accept: application/json
+
+### stock-balances — create
+# @name createStockBalance
+POST {{api}}/stock-balances/
+Content-Type: application/json
+
+{
+  "item": "{{createItem.response.body.id}}",
+  "storage_location": "{{createStorage.response.body.id}}",
+  "zone_label": "",
+  "quantity": "10.000"
+}
+
+### stock-balances — detail
+GET {{api}}/stock-balances/{{createStockBalance.response.body.id}}/
+Accept: application/json
+
+###############################################################################
+### projects
+GET {{api}}/projects/
+Accept: application/json
+
+### projects — create (reference must be unique)
+# @name createProject
+POST {{api}}/projects/
+Content-Type: application/json
+
+{
+  "name": "REST Test Project",
+  "reference": "REST-REF-001",
+  "project_type": "residentiel_collectif",
+  "priority": "haute",
+  "criticality": "standard",
+  "tracking_mode": "progress",
+  "agency": "{{createAgency.response.body.id}}"
+}
+
+### projects — detail
+GET {{api}}/projects/{{createProject.response.body.id}}/
+Accept: application/json
+
+###############################################################################
+### project-resources
+GET {{api}}/project-resources/
+Accept: application/json
+
+### project-resources — create
+# @name createProjectResource
+POST {{api}}/project-resources/
+Content-Type: application/json
+
+{
+  "project": "{{createProject.response.body.id}}",
+  "resource_kind": "equipment",
+  "name": "REST Test Resource"
+}
+
+### project-resources — detail
+GET {{api}}/project-resources/{{createProjectResource.response.body.id}}/
+Accept: application/json
+
+###############################################################################
+### stock-movements
+GET {{api}}/stock-movements/
+Accept: application/json
+
+### stock-movements — create
+# @name createStockMovement
+POST {{api}}/stock-movements/
+Content-Type: application/json
+
+{
+  "movement_type": "entree",
+  "item": "{{createItem.response.body.id}}",
+  "quantity": "1.000",
+  "destination_storage_location": "{{createStorage.response.body.id}}",
+  "comment": "REST client test"
+}
+
+### stock-movements — detail
+GET {{api}}/stock-movements/{{createStockMovement.response.body.id}}/
+Accept: application/json
+
+###############################################################################
+### item-project-assignments
+GET {{api}}/item-project-assignments/
+Accept: application/json
+
+### item-project-assignments — create
+# @name createAssignment
+POST {{api}}/item-project-assignments/
+Content-Type: application/json
+
+{
+  "item": "{{createItem.response.body.id}}",
+  "project": "{{createProject.response.body.id}}",
+  "notes": "REST test"
+}
+
+### item-project-assignments — detail
+GET {{api}}/item-project-assignments/{{createAssignment.response.body.id}}/
+Accept: application/json
+
+###############################################################################
+### organization-settings
+GET {{api}}/organization-settings/
+Accept: application/json
+
+### organization-settings — create
+# @name createOrgSettings
+POST {{api}}/organization-settings/
+Content-Type: application/json
+
+{
+  "global_low_stock_threshold_percent": 15,
+  "expiry_alert_days_before": 30,
+  "expiry_alerts_enabled": false,
+  "predictive_analysis_enabled": true,
+  "auto_reports_enabled": false
+}
+
+### organization-settings — detail
+GET {{api}}/organization-settings/{{createOrgSettings.response.body.id}}/
+Accept: application/json
+
+###############################################################################
+### integrations
+GET {{api}}/integrations/
+Accept: application/json
+
+### integrations — create
+# @name createIntegration
+POST {{api}}/integrations/
+Content-Type: application/json
+
+{
+  "provider_key": "rest_test_provider",
+  "display_name": "REST Test Integration",
+  "is_connected": false,
+  "config": {}
+}
+
+### integrations — detail
+GET {{api}}/integrations/{{createIntegration.response.body.id}}/
+Accept: application/json
+
+###############################################################################
+### roles
+GET {{api}}/roles/
+Accept: application/json
+
+### roles — create
+# @name createRole
+POST {{api}}/roles/
+Content-Type: application/json
+
+{
+  "name": "REST Test Role",
+  "description": "Created by test.rest"
+}
+
+### roles — detail
+GET {{api}}/roles/{{createRole.response.body.id}}/
+Accept: application/json
+
+###############################################################################
+### permissions
+GET {{api}}/permissions/
+Accept: application/json
+
+### permissions — create
+# @name createPermission
+POST {{api}}/permissions/
+Content-Type: application/json
+
+{
+  "code": "rest.test.permission",
+  "description": "REST test"
+}
+
+### permissions — detail
+GET {{api}}/permissions/{{createPermission.response.body.id}}/
+Accept: application/json
+
+###############################################################################
+### role-permissions
+GET {{api}}/role-permissions/
+Accept: application/json
+
+### role-permissions — create
+# @name createRolePermission
+POST {{api}}/role-permissions/
+Content-Type: application/json
+
+{
+  "role": "{{createRole.response.body.id}}",
+  "permission": "{{createPermission.response.body.id}}"
+}
+
+### role-permissions — detail
+GET {{api}}/role-permissions/{{createRolePermission.response.body.id}}/
+Accept: application/json
+
+###############################################################################
+### user-roles (requires valid user pk)
+GET {{api}}/user-roles/
+Accept: application/json
+
+### user-roles — create
+# @name createUserRole
+POST {{api}}/user-roles/
+Content-Type: application/json
+
+{
+  "user": {{userId}},
+  "role": "{{createRole.response.body.id}}"
+}
+
+### user-roles — detail
+GET {{api}}/user-roles/{{createUserRole.response.body.id}}/
+Accept: application/json
+
+###############################################################################
+### activity-events
+GET {{api}}/activity-events/
+Accept: application/json
+
+### activity-events — create
+# @name createActivityEvent
+POST {{api}}/activity-events/
+Content-Type: application/json
+
+{
+  "entity_type": "Item",
+  "entity_id": "{{createItem.response.body.id}}",
+  "action": "rest_test",
+  "payload": {"source": "test.rest"}
+}
+
+### activity-events — detail
+GET {{api}}/activity-events/{{createActivityEvent.response.body.id}}/
+Accept: application/json
+
+###############################################################################
+### Optional cleanup (run in reverse dependency order if desired)
+# DELETE {{api}}/activity-events/{{createActivityEvent.response.body.id}}/
+# DELETE {{api}}/user-roles/{{createUserRole.response.body.id}}/
+# DELETE {{api}}/role-permissions/{{createRolePermission.response.body.id}}/
+# DELETE {{api}}/permissions/{{createPermission.response.body.id}}/
+# DELETE {{api}}/roles/{{createRole.response.body.id}}/
+# DELETE {{api}}/integrations/{{createIntegration.response.body.id}}/
+# DELETE {{api}}/organization-settings/{{createOrgSettings.response.body.id}}/
+# DELETE {{api}}/item-project-assignments/{{createAssignment.response.body.id}}/
+# DELETE {{api}}/stock-movements/{{createStockMovement.response.body.id}}/
+# DELETE {{api}}/project-resources/{{createProjectResource.response.body.id}}/
+# DELETE {{api}}/projects/{{createProject.response.body.id}}/
+# DELETE {{api}}/stock-balances/{{createStockBalance.response.body.id}}/
+# DELETE {{api}}/items/{{createItem.response.body.id}}/
+# DELETE {{api}}/user-profiles/{{createUserProfile.response.body.id}}/
+# DELETE {{api}}/categories/{{createCategory.response.body.id}}/
+# DELETE {{api}}/units-of-measure/{{createUnit.response.body.id}}/
+# DELETE {{api}}/storage-locations/{{createStorage.response.body.id}}/
+# DELETE {{api}}/agencies/{{createAgency.response.body.id}}/
+# DELETE {{api}}/sites/{{createSite.response.body.id}}/

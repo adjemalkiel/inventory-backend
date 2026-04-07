@@ -1,0 +1,34 @@
+# Render Blueprint: https://render.com/docs/blueprint-spec
+# Monorepo: set the service "Root Directory" to `inventory-backend`, or move this file to the repo root
+# and set dockerfilePath / dockerContext accordingly.
+
+databases:
+  - name: inventory-db
+    databaseName: inventory
+    plan: free
+    region: oregon
+
+services:
+  - type: web
+    name: inventory-api
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./docker/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health/
+    envVars:
+      - key: DJANGO_DEBUG
+        value: "false"
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      - key: DJANGO_ALLOWED_HOSTS
+        sync: false
+      - key: DJANGO_CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: WEB_CONCURRENCY
+        value: "2"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: inventory-db
+          property: connectionString
