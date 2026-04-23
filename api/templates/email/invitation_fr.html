@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Invitation Bâtir Pro</title>
+</head>
+<body style="margin:0; padding:0; background-color:#F7F9FB; font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color:#191c1e;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#F7F9FB; padding:24px 12px 40px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" style="max-width:520px;" cellspacing="0" cellpadding="0">
+          <tr>
+            <td style="padding:8px 4px 24px; text-align:left;">
+              <span style="font-size:22px; font-weight:800; color:#091426; letter-spacing:-0.02em;">Bâtir Pro</span>
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#ffffff; border-radius:12px; box-shadow:0 20px 40px rgba(9, 20, 38, 0.06); border:1px solid #e6e8ea;">
+                <tr>
+                  <td style="padding:32px 28px 28px;">
+                    <h1 style="margin:0 0 12px; font-size:1.35rem; font-weight:800; color:#091426; line-height:1.25;">
+                      Vous avez été invité
+                    </h1>
+                    <p style="margin:0 0 16px; font-size:15px; line-height:1.55; color:#45474c;">
+                      Bonjour <strong style="color:#1e293b;">{{ prenom }}</strong>,
+                    </p>
+                    <p style="margin:0 0 16px; font-size:15px; line-height:1.55; color:#45474c;">
+                      Un compte a été créé sur <strong style="color:#1e293b;">Bâtir Pro</strong> pour l’adresse
+                      <strong style="color:#1e293b;">{{ email }}</strong>. Vous pourrez y accéder dès que vous aurez défini votre mot de passe.
+                    </p>
+                    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#f2f4f6; border-radius:8px; margin-bottom:20px;">
+                      <tr>
+                        <td style="padding:14px 16px;">
+                          <p style="margin:0 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:0.08em; color:#57657a;">Rôle</p>
+                          <p style="margin:0; font-size:15px; font-weight:600; color:#1e293b;">{{ role_label }}</p>
+                          <p style="margin:12px 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:0.08em; color:#57657a;">Fonction</p>
+                          <p style="margin:0; font-size:15px; font-weight:600; color:#1e293b;">{{ job_title }}</p>
+                          <p style="margin:12px 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:0.08em; color:#57657a;">Site</p>
+                          <p style="margin:0; font-size:15px; font-weight:600; color:#1e293b;">{{ site_name }}</p>
+                        </td>
+                      </tr>
+                    </table>
+                    <p style="margin:0 0 20px; font-size:15px; line-height:1.55; color:#45474c;">
+                      Cliquez sur le bouton ci-dessous pour <strong>choisir un mot de passe</strong> et activer l’accès (lien valable comme pour une réinitialisation de mot de passe).
+                    </p>
+                    <div style="text-align:center; margin:24px 0;">
+                      <a href="{{ lien_mot_de_passe }}" style="display:inline-block; padding:14px 28px; background-color:#091426; color:#ffffff; font-size:14px; font-weight:700; text-decoration:none; border-radius:10px;">Définir mon mot de passe</a>
+                    </div>
+                    <p style="margin:16px 0 0; font-size:12px; line-height:1.5; color:#75777d;">
+                      En cas de question, écrivez à
+                      <a href="mailto:{{ equipe_assistance_email }}" style="color:#1e293b;">{{ equipe_assistance_email }}</a>.
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:16px 8px; text-align:center; font-size:11px; color:#75777d;">
+              Message généré automatiquement — merci de ne pas répondre directement à ce message.
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

@@ -151,6 +151,59 @@ class UserProfile(AuditedModel):
         related_name="users",
     )
     job_title = models.CharField(max_length=255, blank=True)
+    phone = models.CharField(max_length=64, blank=True)
+
+    class LanguagePref(models.TextChoices):
+        FR_FR = "fr-FR", "Français (France)"
+        EN_US = "en-US", "English (US)"
+
+    class TimezonePref(models.TextChoices):
+        EUROPE_PARIS = "Europe/Paris", "(GMT+01:00) Paris"
+        AFRICA_PORTO_NOVO = "Africa/Porto-Novo", "(GMT+01:00) Cotonou / Porto-Novo"
+        UTC = "UTC", "UTC"
+
+    class DateFormatPref(models.TextChoices):
+        DMY = "dmy", "JJ/MM/AAAA"
+        MDY = "mdy", "MM/JJ/AAAA"
+        YMD = "ymd", "AAAA-MM-JJ (ISO)"
+
+    class DisplayDensityPref(models.TextChoices):
+        STANDARD = "standard", "Standard (Editorial)"
+        COMPACT = "compact", "Compact"
+        COMFORTABLE = "comfortable", "Lecture confortable"
+
+    class CurrencyPref(models.TextChoices):
+        EUR = "EUR", "Euro (€)"
+        XOF = "XOF", "Franc CFA (BCEAO)"
+        USD = "USD", "Dollar (US)"
+        CNY = "CNY", "Yuan renminbi (¥)"
+
+    pref_language = models.CharField(
+        max_length=16,
+        choices=LanguagePref.choices,
+        default=LanguagePref.FR_FR,
+    )
+    pref_timezone = models.CharField(
+        max_length=64,
+        choices=TimezonePref.choices,
+        default=TimezonePref.EUROPE_PARIS,
+    )
+    pref_date_format = models.CharField(
+        max_length=16,
+        choices=DateFormatPref.choices,
+        default=DateFormatPref.DMY,
+    )
+    pref_display_density = models.CharField(
+        max_length=32,
+        choices=DisplayDensityPref.choices,
+        default=DisplayDensityPref.STANDARD,
+    )
+    pref_currency = models.CharField(
+        max_length=8,
+        choices=CurrencyPref.choices,
+        default=CurrencyPref.EUR,
+    )
+
     invite_token = models.CharField(max_length=128, blank=True)
     invited_at = models.DateTimeField(null=True, blank=True)
     activated_at = models.DateTimeField(null=True, blank=True)
@@ -403,6 +456,24 @@ class OrganizationSettings(AuditedModel):
     expiry_alerts_enabled = models.BooleanField(default=False)
     predictive_analysis_enabled = models.BooleanField(default=True)
     auto_reports_enabled = models.BooleanField(default=False)
+
+    smtp_enabled = models.BooleanField(
+        default=False,
+        help_text="When set, use these SMTP settings instead of the server .env e-mail config.",
+    )
+    smtp_host = models.CharField(max_length=255, blank=True, default="")
+    smtp_port = models.PositiveIntegerField(default=587)
+    smtp_use_tls = models.BooleanField(default=True)
+    smtp_use_ssl = models.BooleanField(
+        default=False,
+        help_text="Implicit TLS (e.g. port 465). Leave off if using STARTTLS (587).",
+    )
+    smtp_user = models.CharField(max_length=255, blank=True, default="")
+    smtp_password = models.CharField(max_length=255, blank=True, default="")
+    smtp_from_email = models.EmailField(
+        blank=True,
+        help_text="Adresse d’expéditeur pour l’e-mail (sinon paramètre par défaut du serveur).",
+    )
 
     class Meta:
         verbose_name_plural = "Organization settings"

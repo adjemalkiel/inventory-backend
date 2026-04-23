@@ -90,6 +90,7 @@ INSTALLED_APPS = [
 
     'api.apps.ApiConfig',
     'rest_framework',
+    'rest_framework.authtoken',
     'corsheaders',
 ]
 
@@ -199,3 +200,46 @@ STORAGES = {
         'BACKEND': 'whitenoise.storage.CompressedStaticFilesStorage',
     },
 }
+
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.TokenAuthentication',
+    ],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.AllowAny',
+    ],
+}
+
+# Front-end (password reset link in e-mails)
+FRONTEND_BASE_URL = (os.environ.get('FRONTEND_BASE_URL', 'http://localhost:3000') or 'http://localhost:3000').rstrip(
+    '/'
+)
+
+# Password reset link validity (Django; seconds, default 3 days)
+PASSWORD_RESET_TIMEOUT = int(os.environ.get('PASSWORD_RESET_TIMEOUT', '259200') or 259200)
+
+# E-mail
+_email_backend = (os.environ.get('EMAIL_BACKEND') or '').strip()
+if _email_backend:
+    EMAIL_BACKEND = _email_backend
+elif os.environ.get('EMAIL_HOST', '').strip():
+    EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+    EMAIL_HOST = os.environ.get('EMAIL_HOST', 'localhost')
+    EMAIL_PORT = int(os.environ.get('EMAIL_PORT', '587') or 587)
+    EMAIL_USE_TLS = _env_bool('EMAIL_USE_TLS', True)
+    EMAIL_USE_SSL = _env_bool('EMAIL_USE_SSL', False)
+    EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
+    EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+else:
+    EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+
+DEFAULT_FROM_EMAIL = (
+    os.environ.get('DEFAULT_FROM_EMAIL', 'Bâtir Pro <noreply@batirpro.local>') or
+    'Bâtir Pro <noreply@batirpro.local>'
+)
+BATIRPRO_SUPPORT_EMAIL = (os.environ.get('BATIRPRO_SUPPORT_EMAIL', 'support@batirpro.bj') or
+                          'support@batirpro.bj')
+BATIRPRO_ASSISTANCE_URL = (os.environ.get('BATIRPRO_ASSISTANCE_URL', 'https://batirpro.bj/aide') or
+                           'https://batirpro.bj/aide')
+BATIRPRO_PRIVACY_URL = (os.environ.get('BATIRPRO_PRIVACY_URL', 'https://batirpro.bj/confidentialite') or
+                        'https://batirpro.bj/confidentialite')

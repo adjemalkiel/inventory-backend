@@ -116,6 +116,42 @@ GET {{api}}/categories/{{createCategory.response.body.id}}/
 Accept: application/json
 
 ###############################################################################
+### users (Django auth_user — integer pk; password write-only, never in responses)
+GET {{api}}/users/
+Accept: application/json
+
+### users — create
+# @name createUser
+POST {{api}}/users/
+Content-Type: application/json
+
+{
+  "username": "api-test-user",
+  "email": "apitest@example.com",
+  "first_name": "API",
+  "last_name": "Test",
+  "password": "change-me-securely",
+  "is_active": true,
+  "is_staff": false,
+  "is_superuser": false
+}
+
+### users — detail
+GET {{api}}/users/{{createUser.response.body.id}}/
+Accept: application/json
+
+### users — partial update (omit password to leave unchanged)
+PATCH {{api}}/users/{{createUser.response.body.id}}/
+Content-Type: application/json
+
+{
+  "first_name": "API-Updated"
+}
+
+### users — delete
+# DELETE {{api}}/users/{{createUser.response.body.id}}/
+
+###############################################################################
 ### user-profiles (requires valid user pk)
 GET {{api}}/user-profiles/
 Accept: application/json

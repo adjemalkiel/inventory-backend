@@ -1,9 +1,11 @@
+from django.urls import path
 from rest_framework.routers import DefaultRouter
 
 from . import views
 
 router = DefaultRouter()
 router.register(r"sites", views.SiteViewSet, basename="site")
+router.register(r"users", views.UserViewSet, basename="user")
 router.register(r"agencies", views.AgencyViewSet, basename="agency")
 router.register(
     r"storage-locations",
@@ -67,4 +69,19 @@ router.register(
     basename="activity-event",
 )
 
-urlpatterns = router.urls
+urlpatterns = [
+    path("auth/login/", views.auth_login, name="auth-login"),
+    path("auth/logout/", views.auth_logout, name="auth-logout"),
+    path(
+        "auth/password-reset/",
+        views.auth_password_reset_request,
+        name="auth-password-reset",
+    ),
+    path(
+        "auth/password-reset/confirm/",
+        views.auth_password_reset_confirm,
+        name="auth-password-reset-confirm",
+    ),
+    path("me/", views.me, name="me"),
+    path("me/change-password/", views.me_change_password, name="me-change-password"),
+] + router.urls

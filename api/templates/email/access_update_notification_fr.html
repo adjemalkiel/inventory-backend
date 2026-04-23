@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mise à jour de vos accès — Bâtir Pro</title>
+</head>
+<body style="margin:0; padding:0; background-color:#F7F9FB; font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color:#191c1e;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#F7F9FB; padding:24px 12px 40px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" style="max-width:520px; background-color:#F7F9FB;" cellspacing="0" cellpadding="0">
+          <tr>
+            <td style="padding:8px 4px 24px; text-align:left;">
+              <span style="font-size:22px; font-weight:800; color:#091426; letter-spacing:-0.02em; font-family:Georgia, 'Times New Roman', serif;">Bâtir Pro</span>
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#ffffff; border-radius:12px; box-shadow:0 20px 40px rgba(9, 20, 38, 0.06); overflow:hidden; border:1px solid #e6e8ea;">
+                <tr>
+                  <td style="padding:32px 28px 28px;">
+                    <h1 style="margin:0 0 12px; font-size:1.35rem; font-weight:800; color:#091426; line-height:1.25; font-family:Georgia, 'Times New Roman', serif;">
+                      Mise à jour de vos accès
+                    </h1>
+                    <p style="margin:0 0 16px; font-size:15px; line-height:1.55; color:#45474c;">
+                      Bonjour <strong style="color:#1e293b;">{{ prenom }}</strong>,
+                    </p>
+                    <p style="margin:0 0 16px; font-size:15px; line-height:1.55; color:#45474c;">
+                      Votre fiche d’accès a été <strong style="color:#1e293b;">mise à jour</strong> dans l’espace
+                      d’inventaire Bâtir Pro. Vous trouverez ci-dessous le détail de votre profil.
+                    </p>
+                    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#f2f4f6; border-radius:8px; margin-bottom:20px;">
+                      <tr>
+                        <td style="padding:14px 16px; font-size:12px; text-transform:uppercase; letter-spacing:0.08em; color:#57657a;">
+                          Compte
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:0 16px 12px; font-size:15px; font-weight:600; color:#1e293b;">
+                          {{ compte_email }}
+                        </td>
+                      </tr>
+                    </table>
+                    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:separate; border-spacing:0; margin-bottom:8px;">
+                      <tr>
+                        <td style="padding:10px 0; border-bottom:1px solid #eceef0; font-size:13px; color:#57657a; width:38%;">Rôle</td>
+                        <td style="padding:10px 0; border-bottom:1px solid #eceef0; font-size:14px; font-weight:600; color:#091426; text-align:right;">{{ role_label }}</td>
+                      </tr>
+                      <tr>
+                        <td style="padding:10px 0; border-bottom:1px solid #eceef0; font-size:13px; color:#57657a;">Fonction</td>
+                        <td style="padding:10px 0; border-bottom:1px solid #eceef0; font-size:14px; font-weight:600; color:#091426; text-align:right;">{{ job_title }}</td>
+                      </tr>
+                      <tr>
+                        <td style="padding:10px 0; border-bottom:1px solid #eceef0; font-size:13px; color:#57657a;">Site rattaché</td>
+                        <td style="padding:10px 0; border-bottom:1px solid #eceef0; font-size:14px; font-weight:600; color:#091426; text-align:right;">{{ site_label }}</td>
+                      </tr>
+                    </table>
+                    <p style="margin:16px 0 8px; font-size:12px; color:#75777d;">
+                      Modification enregistrée le <strong style="color:#45474c;">{{ date_heure }}</strong>
+                      par <strong style="color:#45474c;">{{ modifie_par }}</strong>.
+                    </p>
+                    <div style="margin:24px 0 0; text-align:center;">
+                      <a href="{{ app_url }}" style="display:inline-block; padding:14px 28px; background-color:#091426; color:#ffffff; font-size:14px; font-weight:700; text-decoration:none; border-radius:10px; letter-spacing:0.01em;">Ouvrir l’application</a>
+                    </div>
+                    <p style="margin:24px 0 0; font-size:12px; line-height:1.5; color:#75777d;">
+                      Si vous n’êtes pas concerné·e par ce message, contactez
+                      <a href="mailto:{{ support_email }}" style="color:#1e293b;">{{ support_email }}</a>.
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:16px 8px; text-align:center; font-size:11px; color:#75777d;">
+              © Bâtir Pro — Cet e-mail a été généré automatiquement, merci de ne pas y répondre.
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
