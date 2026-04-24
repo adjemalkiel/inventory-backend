@@ -199,7 +199,15 @@ class UserProfileSerializer(serializers.ModelSerializer):
     def to_representation(self, instance):
         ret = super().to_representation(instance)
         if self._notify_email_result is not self._NOTIFY_EMAIL_RESULT_UNSET:
-            ret["notify_email_sent"] = bool(self._notify_email_result)
+            # Helpers now return `(sent: bool, delivery_kind: str)` ; préserver
+            # la rétrocompat (bool nu quand l'envoi a été shunté côté create/update).
+            result = self._notify_email_result
+            if isinstance(result, tuple) and len(result) == 2:
+                sent, delivery = result
+                ret["notify_email_sent"] = bool(sent)
+                ret["notify_email_delivery"] = delivery
+            else:
+                ret["notify_email_sent"] = bool(result)
         return ret
 
 
@@ -214,6 +222,7 @@ class InviteUserSerializer(serializers.Serializer):
     role = serializers.ChoiceField(choices=UserProfile.Role.choices)
     site = serializers.UUIDField(allow_null=True, required=False)
     job_title = serializers.CharField(max_length=255, allow_blank=True, default="")
+    phone = serializers.CharField(max_length=64, allow_blank=True, default="")
 
     def validate_email(self, value: str) -> str:
         v = (value or "").strip().lower()
