@@ -193,37 +193,38 @@ def send_user_invitation_email(
     request,
 ) -> tuple[bool, str]:
     """
-    HTML e-mail: invitation to join, role/site summary, and link to set password
-    (same token mechanism as password reset → /reset-password).
+    HTML e-mail: invitation to join, role/site summary, and link to activate
+    the account via `UserProfile.invite_token` (jeton stocké côté serveur,
+    usage unique ; voir `POST /api/v1/auth/activate/`).
 
     Returns `(sent, delivery_kind)` so the admin UI can distinguish a real
     SMTP delivery from a console/dummy fallback.
     """
-    from django.contrib.auth.tokens import default_token_generator
-    from django.utils.encoding import force_bytes
-    from django.utils.http import urlsafe_base64_encode
-
     user = profile.user
     to_email = (getattr(user, "email", None) or "").strip()
     if not to_email:
         logger.warning("Invitation : utilisateur id=%s sans e-mail, envoi ignoré.", user.pk)
         return False, "no-recipient"
 
-    uidb64 = urlsafe_base64_encode(force_bytes(user.pk))
-    token = default_token_generator.make_token(user)
+    raw_invite = (getattr(profile, "invite_token", None) or "").strip()
+    if not raw_invite:
+        logger.warning(
+            "Invitation : profil id=%s sans invite_token, envoi ignoré.",
+            getattr(profile, "pk", None),
+        )
+        return False, "no-invite-token"
+
     q = urlencode(
         {
-            "uid": uidb64,
-            "token": token,
+            "invite": raw_invite,
             "email": user.email,
         }
     )
-    set_password_url = f"{settings.FRONTEND_BASE_URL.rstrip('/')}/reset-password?{q}"
+    set_password_url = f"{settings.FRONTEND_BASE_URL.rstrip('/')}/activate?{q}"
 
     prenom = (getattr(user, "first_name", None) or "").strip() or "Bonjour"
-    role_label = (
-        profile.get_role_display() if hasattr(profile, "get_role_display") else str(profile.role)
-    )
+    from . import rbac as _rbac
+    role_label = _rbac.get_user_role_label(user) or "—"
     if profile.site_id and getattr(profile, "site", None):
         site_name = profile.site.name
     else:
@@ -259,19 +260,20 @@ def send_password_reset_email(
     *,
     user,
     request,
-    uidb64: str,
-    token: str,
+    reset_token: str,
 ) -> tuple[bool, str]:
     """
     Send password reset e-mail (HTML only, `password_reset_fr.html`).
+
+    Le lien pointe vers `/reset-password?reset=…&email=…` ; le jeton est issu
+    de `UserProfile.password_reset_token` (émis par l'API).
 
     Returns `(sent, delivery_kind)` so callers can flag console-backend
     « deliveries » (dev) vs real SMTP.
     """
     q = urlencode(
         {
-            "uid": uidb64,
-            "token": token,
+            "reset": reset_token,
             "email": user.email,
         }
     )
@@ -363,9 +365,8 @@ def send_access_update_notification_email(
     )
 
     prenom = (getattr(user, "first_name", None) or "").strip() or "Utilisateur"
-    role_label = profile.get_role_display() if hasattr(profile, "get_role_display") else str(
-        profile.role
-    )
+    from . import rbac as _rbac
+    role_label = _rbac.get_user_role_label(user) or "—"
     job_title = (getattr(profile, "job_title", None) or "").strip() or "—"
     if profile.site_id and getattr(profile, "site", None):
         site_label = profile.site.name

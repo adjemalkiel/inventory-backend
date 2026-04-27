@@ -26,5 +26,6 @@ def health(_request):
 urlpatterns = [
     path("health/", health),
     path("admin/", admin.site.urls),
-    path("api/", include("api.urls")),
+    # API versionn\u00e9e. Tout nouveau client doit cibler `/api/v1/`.
+    path("api/v1/", include("api.urls")),
 ]

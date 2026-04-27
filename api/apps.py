@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 # Valeurs par défaut pour le tout premier démarrage. Le mot de passe par défaut
 # est volontairement trivial et logué ; il DOIT être changé dès la première
-# connexion (bouton « Réinitialiser le mot de passe » ou /reset-password).
+# connexion (bouton « Mot de passe oublié » ou page /reset-password avec un jeton valide).
 _DEFAULT_SUPERUSER_EMAIL = "admin@batirpro.local"
 _DEFAULT_SUPERUSER_PASSWORD = "ChangezMoi!2026"
 
@@ -41,7 +41,7 @@ def _ensure_default_superuser(sender, **kwargs) -> None:
 
     from django.contrib.auth import get_user_model
 
-    from .models import UserProfile
+    from .models import Role, UserProfile, UserRole
 
     User = get_user_model()
 
@@ -84,8 +84,18 @@ def _ensure_default_superuser(sender, **kwargs) -> None:
 
     UserProfile.objects.get_or_create(
         user=user,
-        defaults={"role": UserProfile.Role.ADMIN, "job_title": "Administrateur"},
+        defaults={"job_title": "Administrateur"},
     )
+
+    # Affecte le rôle RBAC `administrateur` au superuser bootstrap. Le seed
+    # `0008_seed_rbac_catalog` a normalement déjà créé la ligne `Role` ; on
+    # tolère son absence (tests, base partielle) en sortant silencieusement.
+    admin_role = Role.objects.filter(code="administrateur").first()
+    if admin_role is not None:
+        UserRole.objects.get_or_create(
+            user=user,
+            defaults={"role": admin_role},
+        )
 
     using_defaults = (
         email == _DEFAULT_SUPERUSER_EMAIL
@@ -101,7 +111,7 @@ def _ensure_default_superuser(sender, **kwargs) -> None:
         logger.warning(
             "[bootstrap] Identifiants par DÉFAUT utilisés — connectez-vous sur "
             "/login avec e-mail=%s et mot de passe=%s, puis changez-le "
-            "IMMÉDIATEMENT via « Réinitialiser le mot de passe » ou /reset-password. "
+            "IMMÉDIATEMENT via « Mot de passe oublié » ou en définissant un nouveau mot de passe sur /reset-password. "
             "Pour un autre couple d'identifiants, définissez les variables "
             "d'environnement DJANGO_SUPERUSER_EMAIL et DJANGO_SUPERUSER_PASSWORD "
             "avant le premier `migrate`.",

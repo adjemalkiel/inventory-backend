@@ -2,6 +2,7 @@ from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
 from . import mail as mail_helpers
+from . import rbac
 from .models import (
     ActivityEvent,
     Agency,
@@ -129,6 +130,13 @@ class CategorySerializer(serializers.ModelSerializer):
 
 class UserProfileSerializer(serializers.ModelSerializer):
     """
+    Profil utilisateur exposé via `/api/user-profiles/`.
+
+    `role` (lecture & écriture) : slug RBAC (`Role.code`). En lecture, dérivé
+    du `UserRole` lié ; en écriture, upsert le `UserRole` correspondant.
+
+    `role_label` (lecture seule) : libellé humain (FR) du rôle courant.
+
     `notify_user` (write-only) : envoie un e-mail HTML à l’utilisateur après enregistrement
     (uniquement si la valeur est explicitement `true` dans le JSON).
 
@@ -140,16 +148,58 @@ class UserProfileSerializer(serializers.ModelSerializer):
     _NOTIFY_EMAIL_RESULT_UNSET = object()
 
     user_detail = UserSummarySerializer(source="user", read_only=True)
+    role = serializers.ChoiceField(
+        choices=rbac.get_role_choices(),
+        required=False,
+        allow_null=True,
+    )
+    role_label = serializers.SerializerMethodField()
     notify_user = serializers.BooleanField(
         write_only=True,
         required=False,
         allow_null=True,
     )
+    scoped_project_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        allow_empty=True,
+        write_only=True,
+    )
+    scoped_storage_location_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        allow_empty=True,
+        write_only=True,
+    )
 
     class Meta:
         model = UserProfile
-        fields = "__all__"
-        read_only_fields = AUDITED_READ_ONLY
+        fields = (
+            "id",
+            "user",
+            "user_detail",
+            "role",
+            "role_label",
+            "site",
+            "job_title",
+            "phone",
+            "pref_language",
+            "pref_timezone",
+            "pref_date_format",
+            "pref_display_density",
+            "pref_currency",
+            "scoped_project_ids",
+            "scoped_storage_location_ids",
+            "invite_token",
+            "invited_at",
+            "activated_at",
+            "created_at",
+            "updated_at",
+            "created_by",
+            "updated_by",
+            "notify_user",
+        )
+        read_only_fields = AUDITED_READ_ONLY + ("role_label",)
         extra_kwargs = {
             "invite_token": {"write_only": True},
         }
@@ -158,10 +208,69 @@ class UserProfileSerializer(serializers.ModelSerializer):
         super().__init__(*args, **kwargs)
         self._notify_email_result = self._NOTIFY_EMAIL_RESULT_UNSET
 
+    def get_role_label(self, instance: UserProfile) -> str | None:
+        return rbac.get_user_role_label(instance.user)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        # Le champ `role` est défini comme `ChoiceField` pour la validation en
+        # écriture ; en lecture on l'écrase par le slug réel du `UserRole`.
+        ret["role"] = rbac.get_user_role_code(instance.user)
+        ret["scoped_project_ids"] = [
+            str(x) for x in instance.scoped_projects.values_list("id", flat=True)
+        ]
+        ret["scoped_storage_location_ids"] = [
+            str(x)
+            for x in instance.scoped_storage_locations.values_list("id", flat=True)
+        ]
+        if self._notify_email_result is not self._NOTIFY_EMAIL_RESULT_UNSET:
+            # Helpers now return `(sent: bool, delivery_kind: str)` ; préserver
+            # la rétrocompat (bool nu quand l'envoi a été shunté côté create/update).
+            result = self._notify_email_result
+            if isinstance(result, tuple) and len(result) == 2:
+                sent, delivery = result
+                ret["notify_email_sent"] = bool(sent)
+                ret["notify_email_delivery"] = delivery
+            else:
+                ret["notify_email_sent"] = bool(result)
+        return ret
+
+    def _apply_role(self, user, role_code: str | None) -> None:
+        """Crée/met à jour le `UserRole` du `user` selon le slug demandé.
+
+        - `role_code` est un slug `Role.code` (déjà validé par le `ChoiceField`).
+        - `None` est interprété comme « ne pas changer » (cohérent avec
+          `partial=True` côté DRF). Pour _retirer_ un rôle, l'API dédiée
+          `DELETE /api/user-roles/{id}/` reste disponible.
+        """
+        if role_code is None:
+            return
+        role = Role.objects.filter(code=role_code).first()
+        if role is None:
+            raise serializers.ValidationError(
+                {"role": f"Rôle inconnu : {role_code}."}
+            )
+        UserRole.objects.update_or_create(
+            user=user,
+            defaults={"role": role},
+        )
+
     def create(self, validated_data):
         want_notify = validated_data.pop("notify_user", None) is True
+        role_code = validated_data.pop("role", None)
+        scoped_p = validated_data.pop("scoped_project_ids", None)
+        scoped_s = validated_data.pop("scoped_storage_location_ids", None)
         self._notify_email_result = self._NOTIFY_EMAIL_RESULT_UNSET
         instance = super().create(validated_data)
+        if scoped_p is not None:
+            instance.scoped_projects.set(
+                Project.objects.filter(id__in=scoped_p)
+            )
+        if scoped_s is not None:
+            instance.scoped_storage_locations.set(
+                StorageLocation.objects.filter(id__in=scoped_s)
+            )
+        self._apply_role(instance.user, role_code)
         if want_notify:
             fresh = (
                 UserProfile.objects.select_related("user", "site")
@@ -179,8 +288,20 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         want_notify = validated_data.pop("notify_user", None) is True
+        role_code = validated_data.pop("role", None)
+        scoped_p = validated_data.pop("scoped_project_ids", None)
+        scoped_s = validated_data.pop("scoped_storage_location_ids", None)
         self._notify_email_result = self._NOTIFY_EMAIL_RESULT_UNSET
         instance = super().update(instance, validated_data)
+        if scoped_p is not None:
+            instance.scoped_projects.set(
+                Project.objects.filter(id__in=scoped_p)
+            )
+        if scoped_s is not None:
+            instance.scoped_storage_locations.set(
+                StorageLocation.objects.filter(id__in=scoped_s)
+            )
+        self._apply_role(instance.user, role_code)
         if want_notify:
             fresh = (
                 UserProfile.objects.select_related("user", "site")
@@ -196,20 +317,6 @@ class UserProfileSerializer(serializers.ModelSerializer):
                 self._notify_email_result = False
         return instance
 
-    def to_representation(self, instance):
-        ret = super().to_representation(instance)
-        if self._notify_email_result is not self._NOTIFY_EMAIL_RESULT_UNSET:
-            # Helpers now return `(sent: bool, delivery_kind: str)` ; préserver
-            # la rétrocompat (bool nu quand l'envoi a été shunté côté create/update).
-            result = self._notify_email_result
-            if isinstance(result, tuple) and len(result) == 2:
-                sent, delivery = result
-                ret["notify_email_sent"] = bool(sent)
-                ret["notify_email_delivery"] = delivery
-            else:
-                ret["notify_email_sent"] = bool(result)
-        return ret
-
 
 class InviteUserSerializer(serializers.Serializer):
     """
@@ -219,10 +326,20 @@ class InviteUserSerializer(serializers.Serializer):
     email = serializers.EmailField()
     first_name = serializers.CharField(max_length=150, allow_blank=True, default="")
     last_name = serializers.CharField(max_length=150, allow_blank=True, default="")
-    role = serializers.ChoiceField(choices=UserProfile.Role.choices)
+    role = serializers.ChoiceField(choices=rbac.get_role_choices())
     site = serializers.UUIDField(allow_null=True, required=False)
     job_title = serializers.CharField(max_length=255, allow_blank=True, default="")
     phone = serializers.CharField(max_length=64, allow_blank=True, default="")
+    scoped_project_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        allow_empty=True,
+    )
+    scoped_storage_location_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        allow_empty=True,
+    )
 
     def validate_email(self, value: str) -> str:
         v = (value or "").strip().lower()
@@ -237,6 +354,30 @@ class InviteUserSerializer(serializers.Serializer):
             return value
         if not Site.objects.filter(pk=value).exists():
             raise serializers.ValidationError("Site introuvable.")
+        return value
+
+    def validate_scoped_project_ids(self, value: list) -> list:
+        if not value:
+            return value
+        found = set(Project.objects.filter(id__in=value).values_list("id", flat=True))
+        missing = [str(x) for x in value if x not in found]
+        if missing:
+            raise serializers.ValidationError(
+                f"Chantier(s) introuvable(s) : {', '.join(missing)}"
+            )
+        return value
+
+    def validate_scoped_storage_location_ids(self, value: list) -> list:
+        if not value:
+            return value
+        found = set(
+            StorageLocation.objects.filter(id__in=value).values_list("id", flat=True)
+        )
+        missing = [str(x) for x in value if x not in found]
+        if missing:
+            raise serializers.ValidationError(
+                f"Emplacement(s) introuvable(s) : {', '.join(missing)}"
+            )
         return value
 
 
@@ -256,8 +397,17 @@ class MeUserReadSerializer(serializers.ModelSerializer):
 
 
 class MeProfileReadSerializer(serializers.ModelSerializer):
-    role_label = serializers.CharField(source="get_role_display", read_only=True)
+    """Vue lecture seule du profil pour `/api/me/`.
+
+    `role` et `role_label` sont **dérivés du `UserRole`** (système RBAC).
+    Le frontend conserve les mêmes noms de champs qu'avant la migration.
+    """
+
+    role = serializers.SerializerMethodField()
+    role_label = serializers.SerializerMethodField()
     site_name = serializers.CharField(source="site.name", read_only=True, allow_null=True)
+    scoped_project_ids = serializers.SerializerMethodField()
+    scoped_storage_location_ids = serializers.SerializerMethodField()
 
     class Meta:
         model = UserProfile
@@ -274,8 +424,26 @@ class MeProfileReadSerializer(serializers.ModelSerializer):
             "pref_date_format",
             "pref_display_density",
             "pref_currency",
+            "scoped_project_ids",
+            "scoped_storage_location_ids",
         )
         read_only_fields = fields
+
+    def get_role(self, instance: UserProfile) -> str | None:
+        return rbac.get_user_role_code(instance.user)
+
+    def get_role_label(self, instance: UserProfile) -> str | None:
+        return rbac.get_user_role_label(instance.user)
+
+    def get_scoped_project_ids(self, instance: UserProfile) -> list[str]:
+        return [
+            str(x) for x in instance.scoped_projects.values_list("id", flat=True)
+        ]
+
+    def get_scoped_storage_location_ids(self, instance: UserProfile) -> list[str]:
+        return [
+            str(x) for x in instance.scoped_storage_locations.values_list("id", flat=True)
+        ]
 
 
 class MeUpdateSerializer(serializers.Serializer):
@@ -370,11 +538,16 @@ class MeUpdateSerializer(serializers.Serializer):
 def build_me_response(user, profile) -> dict:
     profile = (
         UserProfile.objects.select_related("user", "site")
+        .prefetch_related("scoped_projects", "scoped_storage_locations")
         .get(pk=profile.pk)
     )
     return {
         "user": MeUserReadSerializer(user).data,
         "profile": MeProfileReadSerializer(profile).data,
+        # Permissions effectives de l'utilisateur, dérivées du RBAC. Le frontend
+        # peut s'en servir pour conditionner les actions sensibles (afficher
+        # "Inviter", "Valider un mouvement", etc.). Liste vide si pas de rôle.
+        "permissions": rbac.get_user_permissions(user),
     }
 
 

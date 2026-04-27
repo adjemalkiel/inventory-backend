@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
 import os
+from datetime import timedelta
 from pathlib import Path
 
 from django.core.exceptions import ImproperlyConfigured
@@ -90,7 +91,8 @@ INSTALLED_APPS = [
 
     'api.apps.ApiConfig',
     'rest_framework',
-    'rest_framework.authtoken',
+    'rest_framework_simplejwt',
+    'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
 ]
 
@@ -111,6 +113,11 @@ if _cors_origins.strip():
     CORS_ALLOWED_ORIGINS = [x.strip() for x in _cors_origins.split(',') if x.strip()]
 else:
     CORS_ALLOWED_ORIGINS = ['http://localhost:3000'] if DEBUG else []
+
+# Le refresh token JWT est transport\u00e9 par cookie httpOnly : le navigateur doit
+# avoir le droit d'envoyer/poser le cookie en cross-origin (utile en prod ;
+# en dev, le proxy Vite rend tout same-origin et CORS ne joue pas).
+CORS_ALLOW_CREDENTIALS = True
 
 ROOT_URLCONF = 'backend.urls'
 
@@ -203,12 +210,44 @@ STORAGES = {
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
-        'rest_framework.authentication.TokenAuthentication',
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
     ],
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.AllowAny',
     ],
 }
+
+# JWT (acc\u00e8s court + refresh long, rotation + blacklist apr\u00e8s rotation).
+# Le refresh ne transite jamais par le body : il est pos\u00e9 en cookie httpOnly
+# par /auth/login/ et /auth/refresh/, et lu c\u00f4t\u00e9 serveur via request.COOKIES.
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(
+        minutes=int(os.environ.get('JWT_ACCESS_TTL_MIN', '15') or 15),
+    ),
+    'REFRESH_TOKEN_LIFETIME': timedelta(
+        days=int(os.environ.get('JWT_REFRESH_TTL_DAYS', '7') or 7),
+    ),
+    'ROTATE_REFRESH_TOKENS': True,
+    'BLACKLIST_AFTER_ROTATION': True,
+    # On met \u00e0 jour `last_login` manuellement dans `auth_login` (cf. views.py).
+    'UPDATE_LAST_LOGIN': False,
+    'SIGNING_KEY': SECRET_KEY,
+    'AUTH_HEADER_TYPES': ('Bearer',),
+}
+
+# Param\u00e8tres du cookie httpOnly portant le refresh token. Le `Path` est
+# volontairement restreint pour que le cookie ne soit transmis qu'aux
+# endpoints qui en ont besoin (refresh + logout).
+JWT_REFRESH_COOKIE_NAME = (
+    os.environ.get('JWT_REFRESH_COOKIE_NAME', 'batirpro_refresh') or 'batirpro_refresh'
+)
+JWT_REFRESH_COOKIE_PATH = (
+    os.environ.get('JWT_REFRESH_COOKIE_PATH', '/api/v1/auth') or '/api/v1/auth'
+)
+JWT_REFRESH_COOKIE_SECURE = _env_bool('JWT_REFRESH_COOKIE_SECURE', not DEBUG)
+JWT_REFRESH_COOKIE_SAMESITE = (
+    os.environ.get('JWT_REFRESH_COOKIE_SAMESITE', 'Lax') or 'Lax'
+)
 
 # Front-end (password reset link in e-mails)
 FRONTEND_BASE_URL = (os.environ.get('FRONTEND_BASE_URL', 'http://localhost:3000') or 'http://localhost:3000').rstrip(

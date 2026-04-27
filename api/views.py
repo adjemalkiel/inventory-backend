@@ -1,18 +1,20 @@
+from datetime import timedelta
+
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import update_last_login
-from django.contrib.auth.tokens import default_token_generator
 import secrets
 
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
-from django.utils.encoding import force_bytes
-from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from django.conf import settings
-from rest_framework import status, viewsets
-from rest_framework.authtoken.models import Token
+from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
+from rest_framework_simplejwt.serializers import TokenRefreshSerializer
+from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import (
     ActivityEvent,
@@ -41,6 +43,9 @@ from .mail import (
     send_user_invitation_email,
     smtp_connection_test_hint,
 )
+from . import access, rbac
+from . import scope as user_scope
+from .permissions import IsAdminRole
 from .serializers import (
     ActivityEventSerializer,
     AgencySerializer,
@@ -71,6 +76,28 @@ from .serializers import (
 User = get_user_model()
 
 
+def _issue_password_reset_for_user(*, user, request) -> tuple[bool, str]:
+    """
+    Enregistre un jeton sur `UserProfile` et envoie l’e-mail avec le lien
+    `/reset-password?reset=…` (usage : « mot de passe oublié » ou action admin).
+    """
+    profile, _ = UserProfile.objects.get_or_create(user=user)
+    raw = secrets.token_urlsafe(48)
+    now = timezone.now()
+    profile.password_reset_token = raw
+    profile.password_reset_sent_at = now
+    profile.save(
+        update_fields=[
+            "password_reset_token",
+            "password_reset_sent_at",
+            "updated_at",
+        ]
+    )
+    return send_password_reset_email(
+        user=user, request=request, reset_token=raw
+    )
+
+
 class SetAuditUsersMixin:
     """Set created_by / updated_by from request.user when authenticated."""
 
@@ -88,6 +115,7 @@ class SetAuditUsersMixin:
 
 
 class SiteViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.SiteViewSetAccess]
     queryset = Site.objects.all()
     serializer_class = SiteSerializer
 
@@ -97,6 +125,7 @@ class UserViewSet(viewsets.ModelViewSet):
     CRUD for Django's built-in User (no custom user model in api.models).
     """
 
+    permission_classes = [IsAuthenticated, access.UsersOrProfilesAccess]
     queryset = User.objects.all().order_by("username")
     serializer_class = UserSerializer
 
@@ -104,12 +133,13 @@ class UserViewSet(viewsets.ModelViewSet):
         detail=False,
         methods=["post"],
         url_path="invite",
-        permission_classes=[IsAuthenticated],
+        permission_classes=[IsAuthenticated, IsAdminRole],
     )
     def invite(self, request):
         """
         Créer un utilisateur inactif côté mot de passe, son profil, et envoyer
-        l’e-mail d’invitation (lien pour définir le mot de passe, comme reset).
+        l’e-mail d’invitation (lien `/activate` validé par `POST /auth/activate/`
+        avec `invite_token` stocké sur le profil).
         """
         ser = InviteUserSerializer(data=request.data, context={"request": request})
         ser.is_valid(raise_exception=True)
@@ -140,7 +170,6 @@ class UserViewSet(viewsets.ModelViewSet):
                 site = Site.objects.get(pk=d["site"])
             prof = UserProfile.objects.create(
                 user=user,
-                role=d["role"],
                 job_title=(d.get("job_title") or "").strip()[:255],
                 phone=(d.get("phone") or "").strip()[:64],
                 site=site,
@@ -150,8 +179,36 @@ class UserViewSet(viewsets.ModelViewSet):
                 updated_by=request.user,
             )
 
+            # Affecte le rôle RBAC (un seul rôle par utilisateur, contrainte
+            # `uniq_user_one_role`). Le slug a été validé par
+            # `InviteUserSerializer.role` contre `rbac.get_role_choices()`.
+            invited_role = Role.objects.filter(code=d["role"]).first()
+            if invited_role is None:
+                # Filet de sécurité : la validation a déjà rejeté les codes
+                # inconnus, mais on évite un crash 500 si le seed RBAC n'a pas
+                # encore tourné dans cet environnement.
+                raise serializers.ValidationError(
+                    {"role": f"Rôle inconnu : {d['role']}."}
+                )
+            UserRole.objects.update_or_create(
+                user=user,
+                defaults={"role": invited_role},
+            )
+
+            if "scoped_project_ids" in d:
+                prof.scoped_projects.set(
+                    Project.objects.filter(id__in=d["scoped_project_ids"])
+                )
+            if "scoped_storage_location_ids" in d:
+                prof.scoped_storage_locations.set(
+                    StorageLocation.objects.filter(
+                        id__in=d["scoped_storage_location_ids"]
+                    )
+                )
+
         fresh = (
             UserProfile.objects.select_related("user", "site")
+            .prefetch_related("scoped_projects", "scoped_storage_locations")
             .filter(pk=prof.pk)
             .first()
         )
@@ -173,7 +230,7 @@ class UserViewSet(viewsets.ModelViewSet):
         detail=True,
         methods=["post"],
         url_path="resend-invitation",
-        permission_classes=[IsAuthenticated],
+        permission_classes=[IsAuthenticated, IsAdminRole],
     )
     def resend_invitation(self, request, pk=None):
         """
@@ -221,7 +278,7 @@ class UserViewSet(viewsets.ModelViewSet):
         detail=True,
         methods=["post"],
         url_path="send-password-reset",
-        permission_classes=[IsAuthenticated],
+        permission_classes=[IsAuthenticated, IsAdminRole],
     )
     def send_password_reset(self, request, pk=None):
         """
@@ -250,11 +307,7 @@ class UserViewSet(viewsets.ModelViewSet):
                 {"detail": "Ce compte n'a pas d'adresse e-mail."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        uid = urlsafe_base64_encode(force_bytes(user.pk))
-        token = default_token_generator.make_token(user)
-        sent, delivery = send_password_reset_email(
-            user=user, request=request, uidb64=uid, token=token
-        )
+        sent, delivery = _issue_password_reset_for_user(user=user, request=request)
         return Response(
             {
                 "user": UserSerializer(user).data,
@@ -265,55 +318,132 @@ class UserViewSet(viewsets.ModelViewSet):
 
 
 class AgencyViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.AgencyProjectScopeAccess]
     queryset = Agency.objects.all()
     serializer_class = AgencySerializer
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        u = self.request.user
+        if not u.is_authenticated:
+            return qs.none()
+        if getattr(u, "is_superuser", False) or rbac.is_admin(u):
+            return qs
+        r = rbac.get_user_role_code(u)
+        if r in access._RO_BLOCK_PROJECT_READ:
+            return qs.none()
+        if r in (
+            "conducteur_travaux",
+            "comptable",
+            "controleur_gestion",
+        ):
+            return qs
+        pqs = access.project_queryset_for_user(u, Project.objects.all())
+        a_ids = pqs.exclude(agency_id__isnull=True).values_list(
+            "agency_id", flat=True
+        ).distinct()
+        return qs.filter(id__in=a_ids)
+
 
 class StorageLocationViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.StorageLocationAccess]
     queryset = StorageLocation.objects.all()
     serializer_class = StorageLocationSerializer
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        u = self.request.user
+        r = rbac.get_user_role_code(u)
+        if r == "magasinier":
+            sids = user_scope.user_scoped_storage_location_ids(u)
+            if sids is not None:
+                return qs.filter(id__in=sids)
+            return qs.filter(manager_user_id=u.id)
+        return qs
+
 
 class UnitOfMeasureViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.ItemCatalogAccess]
     queryset = UnitOfMeasure.objects.all()
     serializer_class = UnitOfMeasureSerializer
 
 
 class CategoryViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.ItemCatalogAccess]
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
 
 
 class UserProfileViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
-    queryset = UserProfile.objects.select_related("user", "site").all()
+    permission_classes = [IsAuthenticated, access.UsersOrProfilesAccess]
+    queryset = (
+        UserProfile.objects.select_related("user", "site")
+        .prefetch_related("scoped_projects", "scoped_storage_locations")
+        .all()
+    )
     serializer_class = UserProfileSerializer
 
 
 class ItemViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.ItemCatalogAccess]
     queryset = Item.objects.select_related("category", "unit").all()
     serializer_class = ItemSerializer
 
 
 class StockBalanceViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.StockBalanceAccess]
     queryset = StockBalance.objects.select_related(
         "item", "storage_location"
     ).all()
     serializer_class = StockBalanceSerializer
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        u = self.request.user
+        if not u.is_authenticated:
+            return qs.none()
+        if getattr(u, "is_superuser", False) or rbac.is_admin(u):
+            return qs
+        r = rbac.get_user_role_code(u)
+        if r == "magasinier":
+            sids = user_scope.user_scoped_storage_location_ids(u)
+            if sids is not None:
+                return qs.filter(storage_location_id__in=sids)
+            return qs.filter(storage_location__manager_user_id=u.id)
+        if r == "chef_chantier":
+            sids = user_scope.user_scoped_storage_location_ids(u)
+            if sids is not None:
+                return qs.filter(storage_location_id__in=sids)
+        return qs
+
 
 class ProjectViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.AgencyProjectScopeAccess]
     queryset = Project.objects.select_related(
         "agency", "manager", "works_supervisor"
     ).all()
     serializer_class = ProjectSerializer
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        return access.project_queryset_for_user(self.request.user, qs)
+
 
 class ProjectResourceViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.AgencyProjectScopeAccess]
     queryset = ProjectResource.objects.select_related("project").all()
     serializer_class = ProjectResourceSerializer
 
+    def get_queryset(self):
+        qs = super().get_queryset().select_related("project")
+        pqs = access.project_queryset_for_user(
+            self.request.user, Project.objects.all()
+        )
+        return qs.filter(project_id__in=pqs.values_list("id", flat=True))
+
 
 class StockMovementViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.StockMovementAccess]
     queryset = StockMovement.objects.select_related(
         "item",
         "source_storage_location",
@@ -322,12 +452,56 @@ class StockMovementViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     ).all()
     serializer_class = StockMovementSerializer
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        u = self.request.user
+        if rbac.is_admin(u) or getattr(u, "is_superuser", False):
+            return qs
+        r = rbac.get_user_role_code(u)
+        if r in (
+            "comptable",
+            "controleur_gestion",
+            "conducteur_travaux",
+            "responsable_achats",
+        ):
+            return qs
+        if r == "chef_chantier":
+            cids = user_scope.chef_chantier_project_ids(u)
+            if cids is not None:
+                return qs.filter(project_id__in=cids)
+            return qs.filter(
+                Q(project__manager_id=u.id)
+                | Q(project__works_supervisor_id=u.id)
+            )
+        if r == "magasinier":
+            sids = user_scope.user_scoped_storage_location_ids(u)
+            if sids is not None:
+                return qs.filter(
+                    Q(source_storage_location_id__in=sids)
+                    | Q(destination_storage_location_id__in=sids)
+                )
+            return qs.filter(
+                Q(source_storage_location__manager_user_id=u.id)
+                | Q(destination_storage_location__manager_user_id=u.id)
+            )
+        if r == "ouvrier_technicien":
+            return qs.filter(created_by_id=u.id)
+        return qs.none()
+
 
 class ItemProjectAssignmentViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.AgencyProjectScopeAccess]
     queryset = ItemProjectAssignment.objects.select_related(
         "item", "project"
     ).all()
     serializer_class = ItemProjectAssignmentSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset().select_related("project")
+        pqs = access.project_queryset_for_user(
+            self.request.user, Project.objects.all()
+        )
+        return qs.filter(project_id__in=pqs.values_list("id", flat=True))
 
 
 def _merge_smtp_form_overrides(instance: OrganizationSettings, data: dict) -> dict:
@@ -545,6 +719,7 @@ def _run_smtp_debug_session(
 
 
 class OrganizationSettingsViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.SettingsIntegrationAccess]
     queryset = OrganizationSettings.objects.all()
     serializer_class = OrganizationSettingsSerializer
 
@@ -668,35 +843,72 @@ class OrganizationSettingsViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
 
 
 class IntegrationViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.SettingsIntegrationAccess]
     queryset = Integration.objects.all()
     serializer_class = IntegrationSerializer
 
 
 class RoleViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.RbacModelAdminAccess]
     queryset = Role.objects.all()
     serializer_class = RoleSerializer
 
 
 class PermissionViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.RbacModelAdminAccess]
     queryset = Permission.objects.all()
     serializer_class = PermissionSerializer
 
 
 class RolePermissionViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.RbacModelAdminAccess]
     queryset = RolePermission.objects.select_related("role", "permission").all()
     serializer_class = RolePermissionSerializer
 
 
 class UserRoleViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.RbacModelAdminAccess]
     queryset = UserRole.objects.select_related("user", "role").all()
     serializer_class = UserRoleSerializer
 
 
 class ActivityEventViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.ActivityEventAccess]
     queryset = ActivityEvent.objects.select_related(
         "created_by", "updated_by"
     ).all()
     serializer_class = ActivityEventSerializer
+
+
+def _set_refresh_cookie(response, refresh_value: str, *, persistent: bool) -> None:
+    """
+    Pose le cookie httpOnly portant le refresh token.
+
+    `persistent=True` \u2192 cookie avec `Max-Age` = TTL du refresh (« rester connect\u00e9 »).
+    `persistent=False` \u2192 cookie de session, supprim\u00e9 \u00e0 la fermeture du navigateur.
+    """
+    max_age = (
+        int(settings.SIMPLE_JWT["REFRESH_TOKEN_LIFETIME"].total_seconds())
+        if persistent
+        else None
+    )
+    response.set_cookie(
+        settings.JWT_REFRESH_COOKIE_NAME,
+        refresh_value,
+        max_age=max_age,
+        httponly=True,
+        secure=settings.JWT_REFRESH_COOKIE_SECURE,
+        samesite=settings.JWT_REFRESH_COOKIE_SAMESITE,
+        path=settings.JWT_REFRESH_COOKIE_PATH,
+    )
+
+
+def _clear_refresh_cookie(response) -> None:
+    response.delete_cookie(
+        settings.JWT_REFRESH_COOKIE_NAME,
+        path=settings.JWT_REFRESH_COOKIE_PATH,
+        samesite=settings.JWT_REFRESH_COOKIE_SAMESITE,
+    )
 
 
 @api_view(["POST"])
@@ -704,6 +916,7 @@ class ActivityEventViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
 def auth_login(request):
     email = (request.data.get("email") or "").strip()
     password = request.data.get("password") or ""
+    remember = bool(request.data.get("remember", True))
     if not email or not password:
         return Response(
             {"detail": "Veuillez saisir votre e-mail et votre mot de passe."},
@@ -717,31 +930,150 @@ def auth_login(request):
         )
     if not user.is_active:
         return Response(
-            {"detail": "Ce compte est désactivé. Contactez l'administrateur."},
+            {"detail": "Ce compte est d\u00e9sactiv\u00e9. Contactez l'administrateur."},
             status=status.HTTP_403_FORBIDDEN,
         )
-    token, _ = Token.objects.get_or_create(user=user)
-    # Met à jour `user.last_login` : ce endpoint contourne `django.contrib.auth.login()`
-    # (pas de session côté API token), donc Django ne le ferait pas tout seul et
-    # la colonne « Dernière connexion » dans /users resterait « Jamais ».
+
+    refresh = RefreshToken.for_user(user)
+    # Claim custom : la pr\u00e9f\u00e9rence « rester connect\u00e9 » survit aux rotations
+    # (SimpleJWT pr\u00e9serve les claims utilisateur lors d'un refresh rotatif),
+    # ce qui permet \u00e0 /auth/refresh/ de re-poser un cookie persistant ou non.
+    refresh["rmb"] = 1 if remember else 0
+    # Met \u00e0 jour `user.last_login` : ce endpoint contourne `django.contrib.auth.login()`
+    # (pas de session JWT), donc Django ne le ferait pas tout seul et la colonne
+    # « Derni\u00e8re connexion » dans /users resterait « Jamais ».
     update_last_login(None, user)
-    return Response(
-        {
-            "token": token.key,
-            "user": {
-                "id": user.id,
-                "username": user.username,
-                "email": user.email,
-            },
-        }
-    )
+
+    response = Response({"access": str(refresh.access_token)})
+    _set_refresh_cookie(response, str(refresh), persistent=remember)
+    return response
 
 
 @api_view(["POST"])
-@permission_classes([IsAuthenticated])
+@permission_classes([AllowAny])
+def auth_refresh(request):
+    """
+    \u00c9met un nouvel access token \u00e0 partir du refresh transport\u00e9 par cookie httpOnly.
+    Avec `ROTATE_REFRESH_TOKENS=True` + `BLACKLIST_AFTER_ROTATION=True`, l'ancien
+    refresh est blacklist\u00e9 et un nouveau est r\u00e9-pos\u00e9 dans le cookie.
+    """
+    raw = request.COOKIES.get(settings.JWT_REFRESH_COOKIE_NAME)
+    if not raw:
+        return Response(
+            {"detail": "Session absente."},
+            status=status.HTTP_401_UNAUTHORIZED,
+        )
+    serializer = TokenRefreshSerializer(data={"refresh": raw})
+    try:
+        serializer.is_valid(raise_exception=True)
+    except (InvalidToken, TokenError):
+        response = Response(
+            {"detail": "Session expir\u00e9e."},
+            status=status.HTTP_401_UNAUTHORIZED,
+        )
+        _clear_refresh_cookie(response)
+        return response
+
+    data = serializer.validated_data
+    response = Response({"access": data["access"]})
+    new_refresh_str = data.get("refresh")
+    if new_refresh_str:
+        # Lecture sans validation suppl\u00e9mentaire (le token vient d'\u00eatre \u00e9mis) ;
+        # on r\u00e9cup\u00e8re le claim `rmb` pour reconduire la pr\u00e9f\u00e9rence « rester connect\u00e9 ».
+        try:
+            persistent = bool(RefreshToken(new_refresh_str).get("rmb", 1))
+        except TokenError:
+            persistent = True
+        _set_refresh_cookie(response, new_refresh_str, persistent=persistent)
+    return response
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
 def auth_logout(request):
-    Token.objects.filter(user=request.user).delete()
-    return Response(status=status.HTTP_204_NO_CONTENT)
+    """
+    Blackliste le refresh courant (s'il est valide) et supprime le cookie.
+    Renvoie 204 m\u00eame en l'absence de cookie/refresh, pour que le client
+    puisse appeler /auth/logout/ de fa\u00e7on idempotente.
+    """
+    raw = request.COOKIES.get(settings.JWT_REFRESH_COOKIE_NAME)
+    if raw:
+        try:
+            RefreshToken(raw).blacklist()
+        except TokenError:
+            pass
+    response = Response(status=status.HTTP_204_NO_CONTENT)
+    _clear_refresh_cookie(response)
+    return response
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def auth_activate(request):
+    """
+    Active un compte créé par invitation : valide `UserProfile.invite_token`,
+    définit le mot de passe, renseigne `activated_at` et invalide le jeton (usage unique).
+
+    Distinct de `auth_password_reset_confirm` : ce dernier utilise
+    `UserProfile.password_reset_token` pour les réinitialisations de mot de passe.
+    """
+    invite_token = (request.data.get("invite_token") or "").strip()
+    new_password = request.data.get("new_password") or ""
+    if not invite_token:
+        return Response(
+            {"detail": "Jeton d'invitation manquant."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if len(new_password) < 8:
+        return Response(
+            {"detail": "Le mot de passe doit contenir au moins 8 caractères."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    profile = (
+        UserProfile.objects.select_related("user")
+        .filter(invite_token=invite_token)
+        .first()
+    )
+    if profile is None:
+        return Response(
+            {"detail": "Lien d'invitation invalide ou expiré."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if profile.activated_at is not None:
+        return Response(
+            {
+                "detail": (
+                    "Ce compte est déjà activé. Connectez-vous ou utilisez "
+                    "« Mot de passe oublié » si vous avez oublié votre mot de passe."
+                )
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    user = profile.user
+    if not user.is_active:
+        return Response(
+            {"detail": "Ce compte est désactivé. Contactez l'administrateur."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    with transaction.atomic():
+        user.set_password(new_password)
+        user.save(update_fields=["password"])
+        profile.activated_at = timezone.now()
+        profile.invite_token = ""
+        profile.password_reset_token = ""
+        profile.password_reset_sent_at = None
+        profile.save(
+            update_fields=[
+                "activated_at",
+                "invite_token",
+                "password_reset_token",
+                "password_reset_sent_at",
+                "updated_at",
+            ]
+        )
+    return Response(
+        {"detail": "Votre compte est activé. Vous pouvez vous connecter."}
+    )
 
 
 @api_view(["POST"])
@@ -755,9 +1087,7 @@ def auth_password_reset_request(request):
         )
     user = User.objects.filter(email__iexact=email).first()
     if user is not None and user.is_active:
-        uid = urlsafe_base64_encode(force_bytes(user.pk))
-        token = default_token_generator.make_token(user)
-        send_password_reset_email(user=user, request=request, uidb64=uid, token=token)
+        _issue_password_reset_for_user(user=user, request=request)
     return Response(
         {
             "detail": "Si un compte est associé à cette adresse, un message contenant la procédure de réinitialisation vous a été envoyé. Vérifiez vos courriers indésirables."
@@ -768,12 +1098,15 @@ def auth_password_reset_request(request):
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def auth_password_reset_confirm(request):
-    uidb64 = (request.data.get("uid") or "").strip()
-    token = (request.data.get("token") or "").strip()
+    """
+    Définit un nouveau mot de passe à partir du jeton `UserProfile.password_reset_token`
+    (lien `?reset=` — distinct de l’activation d’invitation `?invite=`).
+    """
+    reset_token = (request.data.get("reset_token") or "").strip()
     new_password = request.data.get("new_password") or ""
-    if not uidb64 or not token:
+    if not reset_token:
         return Response(
-            {"detail": "Lien de réinitialisation invalide."},
+            {"detail": "Jeton de réinitialisation manquant."},
             status=status.HTTP_400_BAD_REQUEST,
         )
     if len(new_password) < 8:
@@ -781,22 +1114,46 @@ def auth_password_reset_confirm(request):
             {"detail": "Le mot de passe doit contenir au moins 8 caractères."},
             status=status.HTTP_400_BAD_REQUEST,
         )
-    try:
-        raw = urlsafe_base64_decode(uidb64)
-        pk = int(raw.decode())
-        user = User.objects.get(pk=pk)
-    except (ValueError, TypeError, OverflowError, UnicodeDecodeError, User.DoesNotExist):
+    profile = (
+        UserProfile.objects.select_related("user")
+        .filter(password_reset_token=reset_token)
+        .first()
+    )
+    if profile is None:
         return Response(
             {"detail": "Lien invalide ou expiré."},
             status=status.HTTP_400_BAD_REQUEST,
         )
-    if not default_token_generator.check_token(user, token):
+    user = profile.user
+    if not user.is_active:
+        return Response(
+            {"detail": "Ce compte est désactivé. Contactez l'administrateur."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    sent_at = profile.password_reset_sent_at
+    if sent_at is None:
         return Response(
             {"detail": "Lien invalide ou expiré."},
             status=status.HTTP_400_BAD_REQUEST,
         )
-    user.set_password(new_password)
-    user.save(update_fields=["password"])
+    timeout_s = int(getattr(settings, "PASSWORD_RESET_TIMEOUT", 259200) or 259200)
+    if timezone.now() - sent_at > timedelta(seconds=timeout_s):
+        return Response(
+            {"detail": "Lien invalide ou expiré."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    with transaction.atomic():
+        user.set_password(new_password)
+        user.save(update_fields=["password"])
+        profile.password_reset_token = ""
+        profile.password_reset_sent_at = None
+        profile.save(
+            update_fields=[
+                "password_reset_token",
+                "password_reset_sent_at",
+                "updated_at",
+            ]
+        )
     send_password_reset_success_email(user=user, request=request)
     return Response(
         {
@@ -810,7 +1167,6 @@ def auth_password_reset_confirm(request):
 def me(request):
     profile, _ = UserProfile.objects.select_related("user", "site").get_or_create(
         user=request.user,
-        defaults={"role": UserProfile.Role.MAGASINIER},
     )
     if request.method == "GET":
         return Response(build_me_response(request.user, profile))

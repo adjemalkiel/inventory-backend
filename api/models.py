@@ -127,21 +127,16 @@ class Category(AuditedModel):
 
 
 class UserProfile(AuditedModel):
-    class Role(models.TextChoices):
-        ADMIN = "administrateur", "Administrateur"
-        MAGASINIER = "magasinier", "Magasinier"
-        CHEF_CHANTIER = "chef_chantier", "Chef de chantier"
-        CONSULTANT = "consultant", "Consultant"
+    """
+    Profil métier d'un compte. Le **rôle** n'est plus stocké ici : il est géré
+    exclusivement par le système RBAC (`Role` + `UserRole` + `Permission` +
+    `RolePermission`). Voir `api.rbac.ROLE_DEFINITIONS` pour le catalogue.
+    """
 
     user = models.OneToOneField(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name="profile",
-    )
-    role = models.CharField(
-        max_length=32,
-        choices=Role.choices,
-        default=Role.MAGASINIER,
     )
     site = models.ForeignKey(
         Site,
@@ -207,6 +202,32 @@ class UserProfile(AuditedModel):
     invite_token = models.CharField(max_length=128, blank=True)
     invited_at = models.DateTimeField(null=True, blank=True)
     activated_at = models.DateTimeField(null=True, blank=True)
+
+    # Réinitialisation de mot de passe (« oublié » ou action admin) — jeton
+    # stocké côté serveur, lien `/reset-password?reset=…` (plus de uid/token Django).
+    password_reset_token = models.CharField(max_length=128, blank=True)
+    password_reset_sent_at = models.DateTimeField(null=True, blank=True)
+
+    scoped_projects = models.ManyToManyField(
+        "Project",
+        blank=True,
+        related_name="scoped_user_profiles",
+        help_text=(
+            "Chantiers assignés : restreint la liste / fiches visibles pour les rôles "
+            "périmètre chantier (ex. chef de chantier). Si vide, repli sur manager / "
+            "conducteur de travaux du projet."
+        ),
+    )
+    scoped_storage_locations = models.ManyToManyField(
+        "StorageLocation",
+        blank=True,
+        related_name="scoped_user_profiles",
+        help_text=(
+            "Emplacements de stock assignés : restreint inventaire et mouvements pour "
+            "les rôles périmètre dépôt (ex. magasinier). Si vide, repli sur "
+            "`StorageLocation.manager_user`."
+        ),
+    )
 
     def __str__(self) -> str:
         return f"{self.user.get_username()} profile"
@@ -496,6 +517,12 @@ class Integration(AuditedModel):
 
 
 class Role(AuditedModel):
+    """
+    Rôle RBAC. `code` est le slug stable utilisé par l'API et le frontend
+    (ex. `magasinier`, `chef_chantier`) ; `name` est le libellé humain (FR).
+    """
+
+    code = models.CharField(max_length=64, unique=True)
     name = models.CharField(max_length=128, unique=True)
     description = models.TextField(blank=True)
 
@@ -539,6 +566,12 @@ class RolePermission(AuditedModel):
 
 
 class UserRole(AuditedModel):
+    """
+    Affectation d'un rôle à un utilisateur. **Un seul rôle par utilisateur**
+    est autorisé (contrainte `uniq_user_one_role`) ; les multi-rôles seront
+    introduits ultérieurement avec une UI dédiée.
+    """
+
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -553,8 +586,8 @@ class UserRole(AuditedModel):
     class Meta:
         constraints = [
             models.UniqueConstraint(
-                fields=["user", "role"],
-                name="uniq_user_role",
+                fields=["user"],
+                name="uniq_user_one_role",
             ),
         ]
 

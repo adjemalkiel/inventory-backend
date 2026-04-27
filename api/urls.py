@@ -71,7 +71,9 @@ router.register(
 
 urlpatterns = [
     path("auth/login/", views.auth_login, name="auth-login"),
+    path("auth/refresh/", views.auth_refresh, name="auth-refresh"),
     path("auth/logout/", views.auth_logout, name="auth-logout"),
+    path("auth/activate/", views.auth_activate, name="auth-activate"),
     path(
         "auth/password-reset/",
         views.auth_password_reset_request,
