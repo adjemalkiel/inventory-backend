@@ -1,6 +1,7 @@
 from django.urls import path
 from rest_framework.routers import DefaultRouter
 
+from . import dashboard_views
 from . import views
 
 router = DefaultRouter()
@@ -86,4 +87,24 @@ urlpatterns = [
     ),
     path("me/", views.me, name="me"),
     path("me/change-password/", views.me_change_password, name="me-change-password"),
+    path(
+        "dashboard/summary/",
+        dashboard_views.dashboard_summary,
+        name="dashboard-summary",
+    ),
+    path(
+        "dashboard/stock-distribution/",
+        dashboard_views.dashboard_stock_distribution,
+        name="dashboard-stock-distribution",
+    ),
+    path(
+        "dashboard/recent-movements/",
+        dashboard_views.dashboard_recent_movements,
+        name="dashboard-recent-movements",
+    ),
+    path(
+        "dashboard/cost-overview/",
+        dashboard_views.dashboard_cost_overview,
+        name="dashboard-cost-overview",
+    ),
 ] + router.urls
