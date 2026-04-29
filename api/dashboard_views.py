@@ -410,6 +410,14 @@ def dashboard_summary(request):
 @permission_classes([IsAuthenticated])
 def dashboard_stock_distribution(request):
     user = request.user
+
+    # Valide date_from/date_to si fournis (aligné sur summary / recent-movements).
+    # Les soldes restent un instantané courant ; paramètres réservés extensions (ex. stock à date).
+    try:
+        _period_from_request(request)
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
     loc_qs = _visible_storage_locations_qs(user).order_by("name")
 
     loc_list = list(loc_qs)
