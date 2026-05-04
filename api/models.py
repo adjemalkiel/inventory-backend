@@ -126,6 +126,23 @@ class Category(AuditedModel):
         return self.name
 
 
+class Supplier(AuditedModel):
+    name = models.CharField(max_length=255)
+    contact_name = models.CharField(max_length=255, blank=True)
+    phone = models.CharField(max_length=64, blank=True)
+    email = models.EmailField(blank=True)
+    address = models.CharField(max_length=512, blank=True)
+    city = models.CharField(max_length=128, blank=True)
+    notes = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
 class UserProfile(AuditedModel):
     """
     Profil métier d'un compte. Le **rôle** n'est plus stocké ici : il est géré
@@ -234,6 +251,12 @@ class UserProfile(AuditedModel):
 
 
 class Item(AuditedModel):
+    class Condition(models.TextChoices):
+        NEW = "neuf", "Neuf"
+        GOOD = "bon", "Bon état"
+        WORN = "use", "Usé"
+        OUT_OF_SERVICE = "hors_service", "Hors service"
+
     name = models.CharField(max_length=255)
     sku = models.CharField(max_length=128, unique=True)
     category = models.ForeignKey(
@@ -245,15 +268,45 @@ class Item(AuditedModel):
     subcategory_label = models.CharField(max_length=255, blank=True)
     brand = models.CharField(max_length=255, blank=True)
     image_url = models.URLField(max_length=1024, blank=True)
+    image = models.ImageField(upload_to="items/%Y/%m/", null=True, blank=True)
     purchase_date = models.DateField(null=True, blank=True)
     warranty_label = models.CharField(max_length=128, blank=True)
     supplier_name = models.CharField(max_length=255, blank=True)
+    supplier = models.ForeignKey(
+        Supplier,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="items",
+    )
     unit = models.ForeignKey(
         UnitOfMeasure,
         on_delete=models.PROTECT,
         related_name="items",
     )
     min_stock = models.DecimalField(max_digits=14, decimal_places=3, default=0)
+    unit_price = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    currency = models.CharField(max_length=8, default="FCFA")
+    serial_number = models.CharField(max_length=128, blank=True)
+    barcode = models.CharField(max_length=128, blank=True)
+    condition = models.CharField(
+        max_length=32,
+        choices=Condition.choices,
+        blank=True,
+    )
+    is_consumable = models.BooleanField(default=True)
+    is_rented = models.BooleanField(default=False)
+    rental_daily_cost = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
     is_active = models.BooleanField(default=True)
 
     class Meta:

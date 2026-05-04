@@ -5,11 +5,26 @@ from django.contrib.auth.models import update_last_login
 import secrets
 
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import (
+    Case,
+    CharField,
+    DecimalField,
+    ExpressionWrapper,
+    F,
+    Q,
+    Sum,
+    Value,
+    When,
+)
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from django.conf import settings
+from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.exceptions import ValidationError
+from rest_framework.filters import OrderingFilter, SearchFilter
+from rest_framework.parsers import MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
@@ -33,6 +48,7 @@ from .models import (
     StockBalance,
     StockMovement,
     StorageLocation,
+    Supplier,
     UnitOfMeasure,
     UserProfile,
     UserRole,
@@ -45,6 +61,7 @@ from .mail import (
 )
 from . import access, rbac
 from . import scope as user_scope
+from .filters import ItemFilter, StockMovementFilter
 from .permissions import IsAdminRole
 from .serializers import (
     ActivityEventSerializer,
@@ -53,6 +70,7 @@ from .serializers import (
     ChangePasswordSerializer,
     IntegrationSerializer,
     InviteUserSerializer,
+    ItemListSerializer,
     ItemProjectAssignmentSerializer,
     ItemSerializer,
     MeUpdateSerializer,
@@ -66,6 +84,7 @@ from .serializers import (
     StockBalanceSerializer,
     StockMovementSerializer,
     StorageLocationSerializer,
+    SupplierSerializer,
     UnitOfMeasureSerializer,
     UserProfileSerializer,
     UserRoleSerializer,
@@ -74,6 +93,53 @@ from .serializers import (
 )
 
 User = get_user_model()
+
+
+def _apply_movement_to_balances(movement: StockMovement) -> None:
+    """Met à jour les `StockBalance` pour un mouvement (transaction attendue par l’appelant)."""
+    qty = movement.quantity
+    src = movement.source_storage_location
+    dst = movement.destination_storage_location
+    audit_user = movement.updated_by or movement.created_by
+
+    if src is not None:
+        balance, _ = StockBalance.objects.select_for_update().get_or_create(
+            item=movement.item,
+            storage_location=src,
+            zone_label="",
+            defaults={
+                "quantity": 0,
+                "updated_by": audit_user,
+                "created_by": audit_user,
+            },
+        )
+        if balance.quantity < qty:
+            raise ValidationError(
+                {
+                    "quantity": (
+                        f"Stock insuffisant dans « {src.name} » : "
+                        f"disponible {balance.quantity}, demandé {qty}."
+                    )
+                }
+            )
+        balance.quantity -= qty
+        balance.updated_by = audit_user
+        balance.save(update_fields=["quantity", "updated_at", "updated_by"])
+
+    if dst is not None:
+        balance, _ = StockBalance.objects.select_for_update().get_or_create(
+            item=movement.item,
+            storage_location=dst,
+            zone_label="",
+            defaults={
+                "quantity": 0,
+                "updated_by": audit_user,
+                "created_by": audit_user,
+            },
+        )
+        balance.quantity += qty
+        balance.updated_by = audit_user
+        balance.save(update_fields=["quantity", "updated_at", "updated_by"])
 
 
 def _issue_password_reset_for_user(*, user, request) -> tuple[bool, str]:
@@ -374,6 +440,12 @@ class CategoryViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     serializer_class = CategorySerializer
 
 
+class SupplierViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.ItemCatalogAccess]
+    queryset = Supplier.objects.filter(is_active=True)
+    serializer_class = SupplierSerializer
+
+
 class UserProfileViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, access.UsersOrProfilesAccess]
     queryset = (
@@ -386,8 +458,105 @@ class UserProfileViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
 
 class ItemViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, access.ItemCatalogAccess]
-    queryset = Item.objects.select_related("category", "unit").all()
     serializer_class = ItemSerializer
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_class = ItemFilter
+    search_fields = [
+        "name",
+        "sku",
+        "description",
+        "brand",
+        "barcode",
+        "serial_number",
+    ]
+    ordering_fields = ["name", "sku", "created_at", "unit_price", "min_stock"]
+    ordering = ["name"]
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return ItemListSerializer
+        return ItemSerializer
+
+    def get_queryset(self):
+        total_qty_expr = Coalesce(
+            Sum("balances__quantity"),
+            Value(0, output_field=DecimalField(max_digits=14, decimal_places=3)),
+        )
+        unit_price_or_zero = Coalesce(
+            F("unit_price"),
+            Value(0, output_field=DecimalField(max_digits=14, decimal_places=2)),
+        )
+        return (
+            Item.objects.select_related("category", "unit", "supplier")
+            .annotate(total_stock=total_qty_expr)
+            .annotate(
+                stock_status=Case(
+                    When(total_stock__lte=0, then=Value("stockout")),
+                    When(total_stock__lt=F("min_stock"), then=Value("low")),
+                    default=Value("available"),
+                    output_field=CharField(),
+                ),
+                stock_value=ExpressionWrapper(
+                    F("total_stock") * unit_price_or_zero,
+                    output_field=DecimalField(max_digits=16, decimal_places=2),
+                ),
+            )
+        )
+
+    @action(detail=True, methods=["get"], url_path="detail")
+    def item_detail(self, request, pk=None):
+        item = self.get_object()
+
+        balances = (
+            StockBalance.objects.filter(item=item)
+            .select_related("storage_location")
+            .order_by("storage_location__name")
+        )
+        movements = (
+            StockMovement.objects.filter(item=item)
+            .select_related(
+                "source_storage_location",
+                "destination_storage_location",
+                "project",
+                "created_by",
+            )
+            .order_by("-created_at")[:10]
+        )
+        assignments = (
+            ItemProjectAssignment.objects.filter(item=item)
+            .select_related("project")
+            .order_by("-assigned_at")
+        )
+
+        return Response(
+            {
+                "item": ItemSerializer(item, context={"request": request}).data,
+                "balances": StockBalanceSerializer(balances, many=True).data,
+                "movements": StockMovementSerializer(movements, many=True).data,
+                "assignments": ItemProjectAssignmentSerializer(
+                    assignments, many=True
+                ).data,
+            }
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="upload-image",
+        parser_classes=[MultiPartParser],
+    )
+    def upload_image(self, request, pk=None):
+        item = self.get_object()
+        file = request.FILES.get("image")
+        if not file:
+            return Response(
+                {"detail": "Aucun fichier fourni."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        item.image.save(file.name, file, save=True)
+        item.image_url = request.build_absolute_uri(item.image.url)
+        item.save(update_fields=["image_url", "updated_at"])
+        return Response({"image_url": item.image_url})
 
 
 class StockBalanceViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
@@ -396,6 +565,7 @@ class StockBalanceViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
         "item", "storage_location"
     ).all()
     serializer_class = StockBalanceSerializer
+    filterset_fields = ["item", "storage_location"]
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -451,6 +621,18 @@ class StockMovementViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
         "project",
     ).all()
     serializer_class = StockMovementSerializer
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    filterset_class = StockMovementFilter
+    ordering_fields = ["created_at", "quantity"]
+    ordering = ["-created_at"]
+
+    def perform_create(self, serializer):
+        user = (
+            self.request.user if self.request.user.is_authenticated else None
+        )
+        with transaction.atomic():
+            movement = serializer.save(created_by=user, updated_by=user)
+            _apply_movement_to_balances(movement)
 
     def get_queryset(self):
         qs = super().get_queryset()

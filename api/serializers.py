@@ -20,6 +20,7 @@ from .models import (
     StockBalance,
     StockMovement,
     StorageLocation,
+    Supplier,
     UnitOfMeasure,
     UserProfile,
     UserRole,
@@ -124,6 +125,13 @@ class UnitOfMeasureSerializer(serializers.ModelSerializer):
 class CategorySerializer(serializers.ModelSerializer):
     class Meta:
         model = Category
+        fields = "__all__"
+        read_only_fields = AUDITED_READ_ONLY
+
+
+class SupplierSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Supplier
         fields = "__all__"
         read_only_fields = AUDITED_READ_ONLY
 
@@ -560,16 +568,99 @@ class ChangePasswordSerializer(serializers.Serializer):
 
 
 class ItemSerializer(serializers.ModelSerializer):
+    category_name = serializers.CharField(source="category.name", read_only=True)
+    unit_name = serializers.CharField(source="unit.name", read_only=True)
+    supplier_display = serializers.CharField(
+        source="supplier.name", read_only=True, allow_null=True
+    )
+
     class Meta:
         model = Item
-        fields = "__all__"
+        fields = tuple(f.name for f in Item._meta.fields) + (
+            "category_name",
+            "unit_name",
+            "supplier_display",
+        )
+        read_only_fields = AUDITED_READ_ONLY
+
+    def create(self, validated_data):
+        instance = super().create(validated_data)
+        if instance.supplier_id:
+            instance.supplier_name = instance.supplier.name
+            instance.save(update_fields=["supplier_name", "updated_at"])
+        return instance
+
+    def update(self, instance, validated_data):
+        instance = super().update(instance, validated_data)
+        if instance.supplier_id:
+            instance.supplier_name = instance.supplier.name
+            instance.save(update_fields=["supplier_name", "updated_at"])
+        return instance
+
+
+class ItemListSerializer(serializers.ModelSerializer):
+    """Liste `/items/` : annotations `total_stock`, `stock_status`, `stock_value`."""
+
+    category_name = serializers.CharField(source="category.name", read_only=True)
+    unit_name = serializers.CharField(source="unit.name", read_only=True)
+    supplier_display = serializers.CharField(
+        source="supplier.name", read_only=True, allow_null=True
+    )
+    total_stock = serializers.DecimalField(
+        max_digits=14, decimal_places=3, read_only=True, default=0
+    )
+    stock_status = serializers.CharField(read_only=True, default="stockout")
+    stock_value = serializers.DecimalField(
+        max_digits=16, decimal_places=2, read_only=True, default=0
+    )
+
+    class Meta:
+        model = Item
+        fields = [
+            "id",
+            "name",
+            "sku",
+            "category",
+            "category_name",
+            "unit",
+            "unit_name",
+            "supplier",
+            "supplier_display",
+            "supplier_name",
+            "description",
+            "subcategory_label",
+            "brand",
+            "image_url",
+            "image",
+            "min_stock",
+            "unit_price",
+            "currency",
+            "is_active",
+            "is_consumable",
+            "is_rented",
+            "condition",
+            "barcode",
+            "serial_number",
+            "rental_daily_cost",
+            "total_stock",
+            "stock_status",
+            "stock_value",
+            "created_at",
+            "updated_at",
+        ]
         read_only_fields = AUDITED_READ_ONLY
 
 
 class StockBalanceSerializer(serializers.ModelSerializer):
+    storage_location_name = serializers.CharField(
+        source="storage_location.name", read_only=True
+    )
+
     class Meta:
         model = StockBalance
-        fields = "__all__"
+        fields = [f.name for f in StockBalance._meta.fields] + [
+            "storage_location_name",
+        ]
         read_only_fields = AUDITED_READ_ONLY
 
 
@@ -588,16 +679,55 @@ class ProjectResourceSerializer(serializers.ModelSerializer):
 
 
 class StockMovementSerializer(serializers.ModelSerializer):
+    item_name = serializers.CharField(source="item.name", read_only=True)
+    item_sku = serializers.CharField(source="item.sku", read_only=True)
+    source_storage_location_name = serializers.CharField(
+        source="source_storage_location.name",
+        read_only=True,
+        allow_null=True,
+    )
+    destination_storage_location_name = serializers.CharField(
+        source="destination_storage_location.name",
+        read_only=True,
+        allow_null=True,
+    )
+    project_name = serializers.CharField(
+        source="project.name", read_only=True, allow_null=True
+    )
+    created_by_name = serializers.SerializerMethodField()
+
     class Meta:
         model = StockMovement
-        fields = "__all__"
+        fields = [f.name for f in StockMovement._meta.fields] + [
+            "item_name",
+            "item_sku",
+            "source_storage_location_name",
+            "destination_storage_location_name",
+            "project_name",
+            "created_by_name",
+        ]
         read_only_fields = AUDITED_READ_ONLY
+
+    def get_created_by_name(self, obj: StockMovement) -> str | None:
+        u = obj.created_by
+        if u is None:
+            return None
+        full = u.get_full_name().strip()
+        return full or u.get_username()
 
 
 class ItemProjectAssignmentSerializer(serializers.ModelSerializer):
+    project_name = serializers.CharField(source="project.name", read_only=True)
+    project_reference = serializers.CharField(
+        source="project.reference", read_only=True
+    )
+
     class Meta:
         model = ItemProjectAssignment
-        fields = "__all__"
+        fields = [f.name for f in ItemProjectAssignment._meta.fields] + [
+            "project_name",
+            "project_reference",
+        ]
         read_only_fields = AUDITED_READ_ONLY
 
 
