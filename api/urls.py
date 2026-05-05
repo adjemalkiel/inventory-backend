@@ -43,6 +43,11 @@ router.register(
     basename="stock-movement",
 )
 router.register(
+    r"approval-rules",
+    views.ApprovalRuleViewSet,
+    basename="approval-rule",
+)
+router.register(
     r"item-project-assignments",
     views.ItemProjectAssignmentViewSet,
     basename="item-project-assignment",

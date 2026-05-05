@@ -24,7 +24,7 @@ from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.exceptions import ValidationError
 from rest_framework.filters import OrderingFilter, SearchFilter
-from rest_framework.parsers import MultiPartParser
+from rest_framework.parsers import JSONParser, MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
@@ -34,6 +34,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from .models import (
     ActivityEvent,
     Agency,
+    ApprovalRule,
     Category,
     Integration,
     Item,
@@ -61,11 +62,12 @@ from .mail import (
 )
 from . import access, rbac
 from . import scope as user_scope
-from .filters import ItemFilter, StockMovementFilter
+from .filters import ApprovalRuleFilter, ItemFilter, StockMovementFilter
 from .permissions import IsAdminRole
 from .serializers import (
     ActivityEventSerializer,
     AgencySerializer,
+    ApprovalRuleSerializer,
     CategorySerializer,
     ChangePasswordSerializer,
     IntegrationSerializer,
@@ -95,8 +97,69 @@ from .serializers import (
 User = get_user_model()
 
 
+MOVEMENT_REFERENCE_PREFIX = {
+    "entree": "BE",
+    "sortie": "BS",
+    "transfert": "BT",
+    "retour": "BR",
+    "ajustement": "BA",
+}
+
+
+def _generate_movement_reference_number(movement: StockMovement) -> str:
+    """Numéro séquentiel mensuel après persistance du mouvement (`BS-YYYY-MM-NNNN`)."""
+    prefix = MOVEMENT_REFERENCE_PREFIX.get(movement.movement_type, "BX")
+    now = timezone.now()
+    year, month = now.year, now.month
+    n = StockMovement.objects.filter(
+        movement_type=movement.movement_type,
+        created_at__year=year,
+        created_at__month=month,
+    ).count()
+    return f"{prefix}-{year}-{month:02d}-{n:04d}"
+
+
 def _apply_movement_to_balances(movement: StockMovement) -> None:
     """Met à jour les `StockBalance` pour un mouvement (transaction attendue par l’appelant)."""
+    if movement.movement_type == StockMovement.MovementType.AJUSTEMENT:
+        loc = movement.source_storage_location or movement.destination_storage_location
+        if loc is None:
+            raise ValidationError(
+                {
+                    "source_storage_location": (
+                        "Un emplacement est requis pour un ajustement."
+                    )
+                }
+            )
+        qty = movement.quantity
+        audit_user = movement.updated_by or movement.created_by
+        balance, _ = StockBalance.objects.select_for_update().get_or_create(
+            item=movement.item,
+            storage_location=loc,
+            zone_label="",
+            defaults={
+                "quantity": 0,
+                "updated_by": audit_user,
+                "created_by": audit_user,
+            },
+        )
+        if movement.source_storage_location_id:
+            if balance.quantity < qty:
+                raise ValidationError(
+                    {
+                        "quantity": (
+                            f"Stock insuffisant dans « {loc.name} » : "
+                            f"disponible {balance.quantity}, ajustement demandé {qty}."
+                        )
+                    }
+                )
+            balance.quantity -= qty
+        else:
+            balance.quantity += qty
+        balance.updated_by = audit_user
+        balance.save(update_fields=["quantity", "updated_at", "updated_by"])
+        return
+
     qty = movement.quantity
     src = movement.source_storage_location
     dst = movement.destination_storage_location
@@ -614,16 +677,24 @@ class ProjectResourceViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
 
 class StockMovementViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, access.StockMovementAccess]
+    parser_classes = [JSONParser, MultiPartParser]
     queryset = StockMovement.objects.select_related(
         "item",
         "source_storage_location",
         "destination_storage_location",
         "project",
+        "approved_by",
     ).all()
     serializer_class = StockMovementSerializer
-    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_class = StockMovementFilter
-    ordering_fields = ["created_at", "quantity"]
+    search_fields = [
+        "reference_number",
+        "item__name",
+        "item__sku",
+        "comment",
+    ]
+    ordering_fields = ["created_at", "quantity", "total_cost"]
     ordering = ["-created_at"]
 
     def perform_create(self, serializer):
@@ -632,7 +703,134 @@ class StockMovementViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
         )
         with transaction.atomic():
             movement = serializer.save(created_by=user, updated_by=user)
+            movement.reference_number = _generate_movement_reference_number(
+                movement
+            )
+            movement.save(
+                update_fields=["reference_number", "updated_at"],
+            )
+            if movement.status == StockMovement.MovementStatus.COMPLETED:
+                _apply_movement_to_balances(movement)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="approve",
+        permission_classes=[IsAuthenticated],
+    )
+    def approve(self, request, pk=None):
+        movement = self.get_object()
+        if not rbac.user_has_permission(request.user, "movement.validate"):
+            return Response(
+                {"detail": "Permission refusée."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if movement.status != StockMovement.MovementStatus.PENDING:
+            return Response(
+                {
+                    "detail": (
+                        f"Ce mouvement est en statut « {movement.status} » "
+                        "et ne peut pas être approuvé."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        with transaction.atomic():
             _apply_movement_to_balances(movement)
+            movement.status = StockMovement.MovementStatus.COMPLETED
+            movement.approved_by = request.user
+            movement.approved_at = timezone.now()
+            movement.updated_by = request.user
+            movement.save(
+                update_fields=[
+                    "status",
+                    "approved_by",
+                    "approved_at",
+                    "updated_by",
+                    "updated_at",
+                ],
+            )
+        fresh = (
+            StockMovement.objects.select_related(
+                "item",
+                "source_storage_location",
+                "destination_storage_location",
+                "project",
+                "approved_by",
+                "created_by",
+            )
+            .filter(pk=movement.pk)
+            .first()
+        )
+        return Response(
+            StockMovementSerializer(
+                fresh,
+                context={"request": request},
+            ).data
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="reject",
+        permission_classes=[IsAuthenticated],
+    )
+    def reject(self, request, pk=None):
+        movement = self.get_object()
+        if not rbac.user_has_permission(request.user, "movement.validate"):
+            return Response(
+                {"detail": "Permission refusée."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if movement.status != StockMovement.MovementStatus.PENDING:
+            return Response(
+                {
+                    "detail": (
+                        f"Ce mouvement est en statut « {movement.status} » "
+                        "et ne peut pas être rejeté."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        reason = (request.data.get("rejection_reason") or "").strip()
+        if not reason:
+            return Response(
+                {"detail": "Un motif de refus est requis."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        movement.status = StockMovement.MovementStatus.REJECTED
+        movement.rejection_reason = reason
+        movement.approved_by = request.user
+        movement.approved_at = timezone.now()
+        movement.updated_by = request.user
+        movement.save(
+            update_fields=[
+                "status",
+                "rejection_reason",
+                "approved_by",
+                "approved_at",
+                "updated_by",
+                "updated_at",
+            ]
+        )
+        fresh = (
+            StockMovement.objects.select_related(
+                "item",
+                "source_storage_location",
+                "destination_storage_location",
+                "project",
+                "approved_by",
+                "created_by",
+            )
+            .filter(pk=movement.pk)
+            .first()
+        )
+        return Response(
+            StockMovementSerializer(
+                fresh,
+                context={"request": request},
+            ).data
+        )
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -669,6 +867,18 @@ class StockMovementViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
         if r == "ouvrier_technicien":
             return qs.filter(created_by_id=u.id)
         return qs.none()
+
+
+class ApprovalRuleViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.RbacModelAdminAccess]
+    queryset = ApprovalRule.objects.select_related(
+        "approver_role", "project"
+    ).all()
+    serializer_class = ApprovalRuleSerializer
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    filterset_class = ApprovalRuleFilter
+    ordering_fields = ["movement_type", "min_value_threshold", "created_at"]
+    ordering = ["movement_type", "min_value_threshold"]
 
 
 class ItemProjectAssignmentViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):

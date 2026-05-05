@@ -1,4 +1,7 @@
+from decimal import Decimal
+
 from django.contrib.auth import get_user_model
+from django.db.models import Q
 from rest_framework import serializers
 
 from . import mail as mail_helpers
@@ -6,6 +9,7 @@ from . import rbac
 from .models import (
     ActivityEvent,
     Agency,
+    ApprovalRule,
     Category,
     Integration,
     Item,
@@ -678,6 +682,42 @@ class ProjectResourceSerializer(serializers.ModelSerializer):
         read_only_fields = AUDITED_READ_ONLY
 
 
+def _fk_from_attrs_or_instance(attrs: dict, instance, field: str):
+    if field in attrs:
+        return attrs[field]
+    if instance is not None:
+        return getattr(instance, field)
+    return None
+
+
+def determine_initial_stock_movement_status(validated_data: dict) -> str:
+    """
+    Retourne `pending` si une règle d'approbation s'applique, sinon `completed`.
+    """
+    mtype = validated_data.get("movement_type")
+    if mtype not in (
+        StockMovement.MovementType.SORTIE,
+        StockMovement.MovementType.TRANSFERT,
+        StockMovement.MovementType.AJUSTEMENT,
+    ):
+        return StockMovement.MovementStatus.COMPLETED
+    total = validated_data.get("total_cost")
+    if total is None:
+        total = Decimal("0")
+    project = validated_data.get("project")
+    pid = project.pk if project is not None else None
+    rules = ApprovalRule.objects.filter(
+        movement_type=mtype,
+        is_active=True,
+        min_value_threshold__lte=total,
+    ).filter(Q(project__isnull=True) | Q(project_id=pid))
+    return (
+        StockMovement.MovementStatus.PENDING
+        if rules.exists()
+        else StockMovement.MovementStatus.COMPLETED
+    )
+
+
 class StockMovementSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source="item.name", read_only=True)
     item_sku = serializers.CharField(source="item.sku", read_only=True)
@@ -695,6 +735,7 @@ class StockMovementSerializer(serializers.ModelSerializer):
         source="project.name", read_only=True, allow_null=True
     )
     created_by_name = serializers.SerializerMethodField()
+    approved_by_name = serializers.SerializerMethodField()
 
     class Meta:
         model = StockMovement
@@ -705,8 +746,15 @@ class StockMovementSerializer(serializers.ModelSerializer):
             "destination_storage_location_name",
             "project_name",
             "created_by_name",
+            "approved_by_name",
         ]
-        read_only_fields = AUDITED_READ_ONLY
+        read_only_fields = AUDITED_READ_ONLY + (
+            "reference_number",
+            "status",
+            "approved_by",
+            "approved_at",
+            "rejection_reason",
+        )
 
     def get_created_by_name(self, obj: StockMovement) -> str | None:
         u = obj.created_by
@@ -714,6 +762,150 @@ class StockMovementSerializer(serializers.ModelSerializer):
             return None
         full = u.get_full_name().strip()
         return full or u.get_username()
+
+    def get_approved_by_name(self, obj: StockMovement) -> str | None:
+        u = obj.approved_by
+        if u is None:
+            return None
+        full = u.get_full_name().strip()
+        return full or u.get_username()
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        inst = self.instance
+
+        movement_type = attrs.get("movement_type")
+        if movement_type is None and inst is not None:
+            movement_type = inst.movement_type
+
+        quantity = attrs.get("quantity")
+        if quantity is None and inst is not None:
+            quantity = inst.quantity
+        if quantity is not None and quantity <= 0:
+            raise serializers.ValidationError(
+                {"quantity": "La quantité doit être strictement positive."}
+            )
+
+        src = _fk_from_attrs_or_instance(attrs, inst, "source_storage_location")
+        dst = _fk_from_attrs_or_instance(attrs, inst, "destination_storage_location")
+        project = _fk_from_attrs_or_instance(attrs, inst, "project")
+        loss_reason = attrs.get("loss_reason")
+        if loss_reason is None and inst is not None:
+            loss_reason = inst.loss_reason
+
+        attrs.pop("total_cost", None)
+
+        if movement_type in (
+            StockMovement.MovementType.SORTIE,
+            StockMovement.MovementType.TRANSFERT,
+        ):
+            if src is None:
+                raise serializers.ValidationError(
+                    {
+                        "source_storage_location": (
+                            "Un lieu source est requis pour ce type de mouvement."
+                        )
+                    }
+                )
+        if movement_type in (
+            StockMovement.MovementType.ENTREE,
+            StockMovement.MovementType.RETOUR,
+            StockMovement.MovementType.TRANSFERT,
+        ):
+            if dst is None:
+                raise serializers.ValidationError(
+                    {
+                        "destination_storage_location": (
+                            "Un lieu de destination est requis pour ce type de mouvement."
+                        )
+                    }
+                )
+        if movement_type == StockMovement.MovementType.TRANSFERT:
+            if src is not None and dst is not None and src.pk == dst.pk:
+                raise serializers.ValidationError(
+                    {
+                        "destination_storage_location": (
+                            "La destination doit être différente de la source."
+                        )
+                    }
+                )
+        if movement_type == StockMovement.MovementType.SORTIE:
+            if project is None:
+                raise serializers.ValidationError(
+                    {"project": "Un chantier est requis pour une sortie vers chantier."}
+                )
+        if movement_type == StockMovement.MovementType.AJUSTEMENT:
+            if src is None and dst is None:
+                raise serializers.ValidationError(
+                    {
+                        "source_storage_location": (
+                            "Un emplacement source ou destination est requis pour un ajustement."
+                        )
+                    }
+                )
+            if src is not None and dst is not None:
+                raise serializers.ValidationError(
+                    {
+                        "destination_storage_location": (
+                            "Un ajustement ne doit porter que sur un seul emplacement "
+                            "(source pour une diminution, destination pour un surplus)."
+                        )
+                    }
+                )
+            if src is not None and not (loss_reason or "").strip():
+                raise serializers.ValidationError(
+                    {
+                        "loss_reason": (
+                            "Un motif est requis pour un ajustement diminuant le stock."
+                        )
+                    }
+                )
+
+        return attrs
+
+    def _computed_total_cost(self, validated_data, instance=None):
+        qty = validated_data.get("quantity")
+        if qty is None and instance is not None:
+            qty = instance.quantity
+        price = validated_data.get("unit_price_at_movement")
+        if price is None and instance is not None:
+            price = instance.unit_price_at_movement
+        if qty is not None and price is not None:
+            return qty * price
+        return None
+
+    def create(self, validated_data):
+        validated_data["total_cost"] = self._computed_total_cost(
+            validated_data, None
+        )
+        validated_data["status"] = determine_initial_stock_movement_status(
+            validated_data
+        )
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        validated_data.pop("total_cost", None)
+        validated_data["total_cost"] = self._computed_total_cost(
+            validated_data, instance
+        )
+        return super().update(instance, validated_data)
+
+
+class ApprovalRuleSerializer(serializers.ModelSerializer):
+    approver_role_name = serializers.CharField(
+        source="approver_role.name", read_only=True
+    )
+    approver_role_code = serializers.CharField(
+        source="approver_role.code", read_only=True
+    )
+
+    class Meta:
+        model = ApprovalRule
+        fields = [f.name for f in ApprovalRule._meta.fields] + [
+            "approver_role_name",
+            "approver_role_code",
+        ]
+        read_only_fields = AUDITED_READ_ONLY
 
 
 class ItemProjectAssignmentSerializer(serializers.ModelSerializer):

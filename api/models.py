@@ -451,10 +451,25 @@ class ProjectResource(AuditedModel):
 
 class StockMovement(AuditedModel):
     class MovementType(models.TextChoices):
-        ENTREE = "entree", "Entrée (Stockage)"
+        ENTREE = "entree", "Entrée (Réception Fournisseur)"
         SORTIE = "sortie", "Sortie (Usage Chantier)"
         TRANSFERT = "transfert", "Transfert Inter-Sites"
         RETOUR = "retour", "Retour de Chantier"
+        AJUSTEMENT = "ajustement", "Ajustement / Correction"
+
+    class MovementStatus(models.TextChoices):
+        DRAFT = "draft", "Brouillon"
+        PENDING = "pending", "En attente de validation"
+        APPROVED = "approved", "Validé"
+        REJECTED = "rejected", "Rejeté"
+        COMPLETED = "completed", "Exécuté"
+
+    class LossReason(models.TextChoices):
+        PERTE = "perte", "Perte"
+        CASSE = "casse", "Casse / Détérioration"
+        VOL = "vol", "Vol"
+        PEREMPTION = "peremption", "Péremption"
+        AUTRE = "autre", "Autre"
 
     movement_type = models.CharField(max_length=16, choices=MovementType.choices)
     item = models.ForeignKey(
@@ -486,11 +501,74 @@ class StockMovement(AuditedModel):
     )
     comment = models.TextField(blank=True)
 
+    status = models.CharField(
+        max_length=32,
+        choices=MovementStatus.choices,
+        default=MovementStatus.DRAFT,
+    )
+    unit_price_at_movement = models.DecimalField(
+        max_digits=14, decimal_places=2, null=True, blank=True
+    )
+    total_cost = models.DecimalField(
+        max_digits=16, decimal_places=2, null=True, blank=True
+    )
+    reference_number = models.CharField(max_length=64, blank=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="approved_stock_movements",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    rejection_reason = models.TextField(blank=True)
+    attachment = models.FileField(
+        upload_to="movements/%Y/%m/", null=True, blank=True
+    )
+    loss_reason = models.CharField(
+        max_length=32,
+        choices=LossReason.choices,
+        blank=True,
+    )
+
     class Meta:
         ordering = ["-created_at"]
 
     def __str__(self) -> str:
         return f"{self.movement_type} {self.quantity} {self.item.sku}"
+
+
+class ApprovalRule(AuditedModel):
+    """Règle déclenchant une approbation avant exécution du mouvement."""
+
+    movement_type = models.CharField(
+        max_length=16,
+        choices=StockMovement.MovementType.choices,
+    )
+    min_value_threshold = models.DecimalField(
+        max_digits=16,
+        decimal_places=2,
+        default=0,
+    )
+    approver_role = models.ForeignKey(
+        "Role",
+        on_delete=models.CASCADE,
+        related_name="approval_rules",
+    )
+    project = models.ForeignKey(
+        Project,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="approval_rules",
+    )
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["movement_type", "min_value_threshold"]
+
+    def __str__(self) -> str:
+        return f"Règle {self.movement_type} ≥ {self.min_value_threshold}"
 
 
 class ItemProjectAssignment(AuditedModel):

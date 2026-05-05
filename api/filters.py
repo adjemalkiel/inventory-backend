@@ -1,7 +1,8 @@
 import django_filters
+from decimal import Decimal
 from django.db.models import F
 
-from .models import Item, StockMovement
+from .models import ApprovalRule, Item, StockMovement
 
 
 class ItemFilter(django_filters.FilterSet):
@@ -45,4 +46,32 @@ class StockMovementFilter(django_filters.FilterSet):
 
     class Meta:
         model = StockMovement
-        fields = ["movement_type", "created_by"]
+        fields = [
+            "movement_type",
+            "created_by",
+            "status",
+            "item",
+            "project",
+            "source_storage_location",
+            "destination_storage_location",
+        ]
+
+
+class ApprovalRuleFilter(django_filters.FilterSet):
+    """
+    Filtrage des règles applicables : `effective_total_cost` (coût total du mouvement)
+    filtre celles où `min_value_threshold <= valeur`.
+    """
+
+    threshold_lte_cost = django_filters.NumberFilter(method="filter_threshold_lte_cost")
+
+    def filter_threshold_lte_cost(self, queryset, name, value):
+        """Règles dont le seuil est inférieur ou égal au coût indiqué (mouvement candidat)."""
+        if value is None:
+            return queryset
+        d = Decimal(str(value))
+        return queryset.filter(min_value_threshold__lte=d)
+
+    class Meta:
+        model = ApprovalRule
+        fields = ["movement_type", "is_active", "project", "approver_role"]
