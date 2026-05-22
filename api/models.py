@@ -344,6 +344,14 @@ class Project(AuditedModel):
         TERTIAIRE = "tertiaire", "Tertiaire / Bureaux"
         INFRA = "infrastructure_publique", "Infrastructure Publique"
 
+    class ProjectStatus(models.TextChoices):
+        BROUILLON = "brouillon", "Brouillon"
+        PLANIFICATION = "planification", "En planification"
+        EN_COURS = "en_cours", "En cours"
+        SUSPENDU = "suspendu", "Suspendu"
+        TERMINE = "termine", "Terminé"
+        ANNULE = "annule", "Annulé"
+
     class Priority(models.TextChoices):
         HAUTE = "haute", "Haute"
         MOYENNE = "moyenne", "Moyenne"
@@ -366,7 +374,11 @@ class Project(AuditedModel):
         default=ProjectType.RESIDENTIEL,
     )
     client_name = models.CharField(max_length=255, blank=True)
-    status = models.CharField(max_length=128, default="En cours de création")
+    status = models.CharField(
+        max_length=32,
+        choices=ProjectStatus.choices,
+        default=ProjectStatus.EN_COURS,
+    )
     priority = models.CharField(
         max_length=16,
         choices=Priority.choices,
@@ -418,11 +430,100 @@ class Project(AuditedModel):
     ai_assistance_enabled = models.BooleanField(default=True)
     is_draft = models.BooleanField(default=False)
 
+    progress_percent = models.PositiveSmallIntegerField(default=0)
+    surface_m2 = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True
+    )
+    contract_value = models.DecimalField(
+        max_digits=16, decimal_places=2, null=True, blank=True
+    )
+    currency = models.CharField(max_length=8, default="XOF")
+    notes = models.TextField(blank=True)
+
     class Meta:
         ordering = ["-created_at"]
 
     def __str__(self) -> str:
         return self.name
+
+
+class ProjectPhase(AuditedModel):
+    """Phase ou lot d'un chantier (ex. Gros œuvre, Second œuvre, Finitions)."""
+
+    class PhaseStatus(models.TextChoices):
+        A_VENIR = "a_venir", "À venir"
+        EN_COURS = "en_cours", "En cours"
+        TERMINE = "termine", "Terminé"
+        EN_RETARD = "en_retard", "En retard"
+
+    project = models.ForeignKey(
+        Project, on_delete=models.CASCADE, related_name="phases"
+    )
+    name = models.CharField(max_length=255)
+    order = models.PositiveSmallIntegerField(default=0)
+    status = models.CharField(
+        max_length=32,
+        choices=PhaseStatus.choices,
+        default=PhaseStatus.A_VENIR,
+    )
+    start_date = models.DateField(null=True, blank=True)
+    end_date = models.DateField(null=True, blank=True)
+    progress_percent = models.PositiveSmallIntegerField(default=0)
+    budget_amount = models.DecimalField(
+        max_digits=16, decimal_places=2, null=True, blank=True
+    )
+    description = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["project", "order"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project", "order"], name="uniq_project_phase_order"
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.project.reference} — {self.name}"
+
+
+class ProjectBudgetLine(AuditedModel):
+    """Ligne budgétaire par poste de coût d'un chantier (matériaux, MO, etc.)."""
+
+    class CostCategory(models.TextChoices):
+        MATERIAUX = "materiaux", "Matériaux"
+        MAIN_OEUVRE = "main_oeuvre", "Main d'œuvre"
+        SOUS_TRAITANCE = "sous_traitance", "Sous-traitance"
+        LOCATION = "location", "Location d'équipements"
+        FRAIS_GENERAUX = "frais_generaux", "Frais généraux"
+        LOGISTIQUE = "logistique", "Transport / Logistique"
+        AUTRE = "autre", "Autre"
+
+    project = models.ForeignKey(
+        Project, on_delete=models.CASCADE, related_name="budget_lines"
+    )
+    phase = models.ForeignKey(
+        "ProjectPhase",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="budget_lines",
+    )
+    category = models.CharField(max_length=32, choices=CostCategory.choices)
+    label = models.CharField(max_length=255, blank=True)
+    budget_amount = models.DecimalField(max_digits=16, decimal_places=2)
+    actual_amount = models.DecimalField(
+        max_digits=16, decimal_places=2, null=True, blank=True
+    )
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["project", "category", "label"]
+
+    def __str__(self) -> str:
+        return (
+            f"{self.project.reference} / {self.get_category_display()}"
+            f" — {self.label or self.category}"
+        )
 
 
 class ProjectResource(AuditedModel):

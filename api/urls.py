@@ -33,6 +33,16 @@ router.register(
 )
 router.register(r"projects", views.ProjectViewSet, basename="project")
 router.register(
+    r"project-phases",
+    views.ProjectPhaseViewSet,
+    basename="project-phase",
+)
+router.register(
+    r"project-budget-lines",
+    views.ProjectBudgetLineViewSet,
+    basename="project-budget-line",
+)
+router.register(
     r"project-resources",
     views.ProjectResourceViewSet,
     basename="project-resource",

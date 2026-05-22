@@ -17,6 +17,8 @@ from .models import (
     OrganizationSettings,
     Permission,
     Project,
+    ProjectBudgetLine,
+    ProjectPhase,
     ProjectResource,
     Role,
     RolePermission,
@@ -669,10 +671,49 @@ class StockBalanceSerializer(serializers.ModelSerializer):
 
 
 class ProjectSerializer(serializers.ModelSerializer):
+    """Sérialiseur enrichi : compteurs et libellés des relations clés."""
+
+    phases_count = serializers.SerializerMethodField()
+    budget_lines_count = serializers.SerializerMethodField()
+    movements_count = serializers.SerializerMethodField()
+    manager_name = serializers.SerializerMethodField()
+    works_supervisor_name = serializers.SerializerMethodField()
+    agency_name = serializers.CharField(
+        source="agency.name", read_only=True, allow_null=True
+    )
+
     class Meta:
         model = Project
-        fields = "__all__"
+        fields = [f.name for f in Project._meta.fields] + [
+            "phases_count",
+            "budget_lines_count",
+            "movements_count",
+            "manager_name",
+            "works_supervisor_name",
+            "agency_name",
+        ]
         read_only_fields = AUDITED_READ_ONLY
+
+    def get_phases_count(self, obj):
+        return obj.phases.count()
+
+    def get_budget_lines_count(self, obj):
+        return obj.budget_lines.count()
+
+    def get_movements_count(self, obj):
+        return obj.stock_movements.count()
+
+    def _user_display(self, user):
+        if not user:
+            return None
+        full = (user.get_full_name() or "").strip()
+        return full or user.get_username()
+
+    def get_manager_name(self, obj):
+        return self._user_display(obj.manager)
+
+    def get_works_supervisor_name(self, obj):
+        return self._user_display(obj.works_supervisor)
 
 
 class ProjectResourceSerializer(serializers.ModelSerializer):
@@ -680,6 +721,77 @@ class ProjectResourceSerializer(serializers.ModelSerializer):
         model = ProjectResource
         fields = "__all__"
         read_only_fields = AUDITED_READ_ONLY
+
+
+class ProjectPhaseSerializer(serializers.ModelSerializer):
+    project_name = serializers.CharField(
+        source="project.name", read_only=True, allow_null=True
+    )
+    project_reference = serializers.CharField(
+        source="project.reference", read_only=True, allow_null=True
+    )
+
+    class Meta:
+        model = ProjectPhase
+        fields = [f.name for f in ProjectPhase._meta.fields] + [
+            "project_name",
+            "project_reference",
+        ]
+        read_only_fields = AUDITED_READ_ONLY
+
+    def validate_progress_percent(self, value):
+        if value < 0 or value > 100:
+            raise serializers.ValidationError(
+                "Le pourcentage d'avancement doit être compris entre 0 et 100."
+            )
+        return value
+
+    def validate(self, attrs):
+        start = attrs.get("start_date") or (
+            self.instance.start_date if self.instance else None
+        )
+        end = attrs.get("end_date") or (
+            self.instance.end_date if self.instance else None
+        )
+        if start and end and end < start:
+            raise serializers.ValidationError(
+                {"end_date": "La date de fin doit être postérieure à la date de début."}
+            )
+        return attrs
+
+
+class ProjectBudgetLineSerializer(serializers.ModelSerializer):
+    project_name = serializers.CharField(
+        source="project.name", read_only=True, allow_null=True
+    )
+    phase_name = serializers.CharField(
+        source="phase.name", read_only=True, allow_null=True
+    )
+    category_label = serializers.CharField(
+        source="get_category_display", read_only=True
+    )
+
+    class Meta:
+        model = ProjectBudgetLine
+        fields = [f.name for f in ProjectBudgetLine._meta.fields] + [
+            "project_name",
+            "phase_name",
+            "category_label",
+        ]
+        read_only_fields = AUDITED_READ_ONLY
+
+    def validate(self, attrs):
+        phase = attrs.get("phase") or (
+            self.instance.phase if self.instance else None
+        )
+        project = attrs.get("project") or (
+            self.instance.project if self.instance else None
+        )
+        if phase is not None and project is not None and phase.project_id != project.id:
+            raise serializers.ValidationError(
+                {"phase": "La phase doit appartenir au chantier sélectionné."}
+            )
+        return attrs
 
 
 def _fk_from_attrs_or_instance(attrs: dict, instance, field: str):

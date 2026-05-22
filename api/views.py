@@ -1,4 +1,5 @@
 from datetime import timedelta
+from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import update_last_login
@@ -42,6 +43,8 @@ from .models import (
     OrganizationSettings,
     Permission,
     Project,
+    ProjectBudgetLine,
+    ProjectPhase,
     ProjectResource,
     Role,
     RolePermission,
@@ -78,6 +81,8 @@ from .serializers import (
     MeUpdateSerializer,
     OrganizationSettingsSerializer,
     PermissionSerializer,
+    ProjectBudgetLineSerializer,
+    ProjectPhaseSerializer,
     ProjectResourceSerializer,
     ProjectSerializer,
     RolePermissionSerializer,
@@ -652,14 +657,151 @@ class StockBalanceViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
 
 class ProjectViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, access.AgencyProjectScopeAccess]
-    queryset = Project.objects.select_related(
-        "agency", "manager", "works_supervisor"
-    ).all()
+    queryset = (
+        Project.objects.select_related("agency", "manager", "works_supervisor")
+        .prefetch_related("phases", "budget_lines", "stock_movements")
+        .all()
+    )
     serializer_class = ProjectSerializer
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = [
+        "status",
+        "priority",
+        "project_type",
+        "agency",
+        "manager",
+        "works_supervisor",
+        "is_draft",
+        "criticality",
+    ]
+    search_fields = ["name", "reference", "client_name", "city", "description"]
+    ordering_fields = [
+        "name",
+        "reference",
+        "start_date",
+        "end_date",
+        "created_at",
+        "budget_amount",
+        "progress_percent",
+    ]
+    ordering = ["-created_at"]
 
     def get_queryset(self):
         qs = super().get_queryset()
         return access.project_queryset_for_user(self.request.user, qs)
+
+    @action(detail=True, methods=["get"], url_path="summary")
+    def summary(self, request, pk=None):
+        """KPIs agrégés pour l'en-tête du détail projet (Section 5.3.4)."""
+        project = self.get_object()
+
+        movements_qs = StockMovement.objects.filter(
+            project=project,
+            status=StockMovement.MovementStatus.COMPLETED,
+        )
+
+        total_movements = movements_qs.count()
+        cost_materials = movements_qs.filter(
+            movement_type=StockMovement.MovementType.SORTIE
+        ).aggregate(
+            total=Coalesce(
+                Sum("total_cost"),
+                Value(Decimal("0"), output_field=DecimalField(max_digits=18, decimal_places=2)),
+            )
+        )["total"]
+
+        budget_lines = ProjectBudgetLine.objects.filter(project=project)
+        budget_lines_total = budget_lines.aggregate(
+            total=Coalesce(
+                Sum("budget_amount"),
+                Value(Decimal("0"), output_field=DecimalField(max_digits=18, decimal_places=2)),
+            )
+        )["total"]
+
+        items_assigned = ItemProjectAssignment.objects.filter(
+            project=project
+        ).count()
+
+        storage_locations_count = (
+            StockMovement.objects.filter(project=project)
+            .exclude(destination_storage_location=None)
+            .values("destination_storage_location")
+            .distinct()
+            .count()
+        )
+
+        # Pour le ratio de consommation : on privilégie le budget global si présent,
+        # sinon le total des lignes ventilées.
+        reference_budget = project.budget_amount or budget_lines_total or Decimal("0")
+        budget_consumed_percent = None
+        if reference_budget and reference_budget > 0:
+            budget_consumed_percent = round(
+                float(cost_materials) / float(reference_budget) * 100, 1
+            )
+
+        return Response(
+            {
+                "project_id": str(project.id),
+                "status": project.status,
+                "progress_percent": project.progress_percent,
+                "budget_amount": (
+                    str(project.budget_amount) if project.budget_amount is not None else None
+                ),
+                "contract_value": (
+                    str(project.contract_value)
+                    if project.contract_value is not None
+                    else None
+                ),
+                "currency": project.currency,
+                "budget_lines_total": str(budget_lines_total),
+                "cost_materials_consumed": str(cost_materials),
+                "budget_consumed_percent": budget_consumed_percent,
+                "total_movements": total_movements,
+                "items_assigned": items_assigned,
+                "storage_locations_count": storage_locations_count,
+                "phases_count": project.phases.count(),
+                # Section 7 alimentera ces champs.
+                "cost_labour": None,
+                "cost_subcontracting": None,
+                "cost_rental": None,
+                "cost_total": None,
+                "margin_percent": None,
+            }
+        )
+
+
+class ProjectPhaseViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.AgencyProjectScopeAccess]
+    queryset = ProjectPhase.objects.select_related("project").all()
+    serializer_class = ProjectPhaseSerializer
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    filterset_fields = ["project", "status"]
+    ordering_fields = ["order", "start_date", "end_date", "created_at"]
+    ordering = ["project", "order"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        pqs = access.project_queryset_for_user(
+            self.request.user, Project.objects.all()
+        )
+        return qs.filter(project_id__in=pqs.values_list("id", flat=True))
+
+
+class ProjectBudgetLineViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, access.AgencyProjectScopeAccess]
+    queryset = ProjectBudgetLine.objects.select_related("project", "phase").all()
+    serializer_class = ProjectBudgetLineSerializer
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    filterset_fields = ["project", "phase", "category"]
+    ordering_fields = ["category", "budget_amount", "created_at"]
+    ordering = ["project", "category", "label"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        pqs = access.project_queryset_for_user(
+            self.request.user, Project.objects.all()
+        )
+        return qs.filter(project_id__in=pqs.values_list("id", flat=True))
 
 
 class ProjectResourceViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):

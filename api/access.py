@@ -226,12 +226,21 @@ class AgencyProjectScopeAccess(BasePermission):
 
 
 def _project_from_obj(obj):
-    """Extrait un `Project` d'un objet (Project, ProjectResource, ItemProjectAssignment, …)."""
-    from .models import ItemProjectAssignment, Project, ProjectResource
+    """Extrait un `Project` d'un objet (Project, ProjectResource, ItemProjectAssignment, ProjectPhase, ProjectBudgetLine)."""
+    from .models import (
+        ItemProjectAssignment,
+        Project,
+        ProjectBudgetLine,
+        ProjectPhase,
+        ProjectResource,
+    )
 
     if isinstance(obj, Project):
         return obj
-    if isinstance(obj, (ProjectResource, ItemProjectAssignment)):
+    if isinstance(
+        obj,
+        (ProjectResource, ItemProjectAssignment, ProjectPhase, ProjectBudgetLine),
+    ):
         return obj.project
     return None
 
