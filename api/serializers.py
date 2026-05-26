@@ -115,10 +115,49 @@ class AgencySerializer(serializers.ModelSerializer):
 
 
 class StorageLocationSerializer(serializers.ModelSerializer):
+    agency_name = serializers.CharField(
+        source="agency.name", read_only=True, allow_null=True
+    )
+    project_name = serializers.CharField(
+        source="project.name", read_only=True, allow_null=True
+    )
+    project_reference = serializers.CharField(
+        source="project.reference", read_only=True, allow_null=True
+    )
+    manager_display = serializers.SerializerMethodField()
+
+    stock_items_count = serializers.IntegerField(read_only=True, default=0)
+    stock_value = serializers.DecimalField(
+        max_digits=18, decimal_places=2, read_only=True, allow_null=True
+    )
+    critical_count = serializers.IntegerField(read_only=True, default=0)
+
     class Meta:
         model = StorageLocation
         fields = "__all__"
         read_only_fields = AUDITED_READ_ONLY
+
+    def get_manager_display(self, obj):
+        if obj.manager_user_id:
+            name = (obj.manager_user.get_full_name() or "").strip()
+            return name or obj.manager_user.get_username()
+        return obj.manager_name or None
+
+    def _sync_manager_name(self, validated_data):
+        mu = validated_data.get("manager_user")
+        if mu is not None and not validated_data.get("manager_name"):
+            validated_data["manager_name"] = (
+                mu.get_full_name() or ""
+            ).strip() or mu.get_username()
+        return validated_data
+
+    def create(self, validated_data):
+        validated_data = self._sync_manager_name(validated_data)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        validated_data = self._sync_manager_name(validated_data)
+        return super().update(instance, validated_data)
 
 
 class UnitOfMeasureSerializer(serializers.ModelSerializer):

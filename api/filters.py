@@ -1,6 +1,6 @@
 import django_filters
 from decimal import Decimal
-from django.db.models import F
+from django.db.models import F, Q
 
 from .models import ApprovalRule, Item, StockMovement
 
@@ -43,6 +43,14 @@ class StockMovementFilter(django_filters.FilterSet):
     created_at_before = django_filters.IsoDateTimeFilter(
         field_name="created_at", lookup_expr="lte"
     )
+    storage_location = django_filters.UUIDFilter(method="filter_by_location")
+
+    def filter_by_location(self, queryset, name, value):
+        """Filtre les mouvements dont la source OU la destination est ce lieu."""
+        return queryset.filter(
+            Q(source_storage_location=value)
+            | Q(destination_storage_location=value)
+        )
 
     class Meta:
         model = StockMovement

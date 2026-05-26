@@ -9,6 +9,7 @@ from django.db import transaction
 from django.db.models import (
     Case,
     CharField,
+    Count,
     DecimalField,
     ExpressionWrapper,
     F,
@@ -483,9 +484,36 @@ class StorageLocationViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, access.StorageLocationAccess]
     queryset = StorageLocation.objects.all()
     serializer_class = StorageLocationSerializer
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ["storage_type", "is_active", "agency", "project"]
+    search_fields = ["name", "address", "city", "manager_name"]
+    ordering_fields = ["name", "storage_type", "city", "created_at"]
+    ordering = ["name"]
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        qs = StorageLocation.objects.select_related(
+            "agency", "project", "manager_user"
+        ).annotate(
+            stock_items_count=Count(
+                "stock_balances__item", distinct=True
+            ),
+            stock_value=Coalesce(
+                Sum(
+                    F("stock_balances__quantity")
+                    * F("stock_balances__item__unit_price"),
+                    output_field=DecimalField(max_digits=18, decimal_places=2),
+                ),
+                Value(0, output_field=DecimalField(max_digits=18, decimal_places=2)),
+            ),
+            critical_count=Count(
+                "stock_balances__item",
+                filter=Q(
+                    stock_balances__quantity__gt=0,
+                    stock_balances__quantity__lt=F("stock_balances__item__min_stock"),
+                ),
+                distinct=True,
+            ),
+        )
         u = self.request.user
         r = rbac.get_user_role_code(u)
         if r == "magasinier":
@@ -494,6 +522,119 @@ class StorageLocationViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
                 return qs.filter(id__in=sids)
             return qs.filter(manager_user_id=u.id)
         return qs
+
+    @action(detail=True, methods=["get"], url_path="summary")
+    def summary(self, request, pk=None):
+        """KPIs agrégés pour un lieu de stockage (Section 6.3.3)."""
+        location = self.get_object()
+        today = timezone.now().date()
+
+        balances_qs = StockBalance.objects.filter(storage_location=location)
+
+        items_count = (
+            balances_qs.filter(quantity__gt=0).values("item").distinct().count()
+        )
+
+        stock_value = balances_qs.aggregate(
+            total=Coalesce(
+                Sum(
+                    F("quantity") * F("item__unit_price"),
+                    output_field=DecimalField(max_digits=18, decimal_places=2),
+                ),
+                Value(
+                    Decimal("0"),
+                    output_field=DecimalField(max_digits=18, decimal_places=2),
+                ),
+            )
+        )["total"]
+
+        stockout_count = (
+            balances_qs.filter(quantity__lte=0).values("item").distinct().count()
+        )
+
+        critical_count = (
+            balances_qs.filter(
+                quantity__gt=0,
+                quantity__lt=F("item__min_stock"),
+            )
+            .values("item")
+            .distinct()
+            .count()
+        )
+
+        movements_qs = StockMovement.objects.filter(
+            Q(source_storage_location=location)
+            | Q(destination_storage_location=location)
+        )
+        movements_today = movements_qs.filter(created_at__date=today).count()
+        movements_week = movements_qs.filter(
+            created_at__date__gte=today - timedelta(days=7)
+        ).count()
+
+        zones = list(
+            balances_qs.exclude(zone_label="")
+            .values_list("zone_label", flat=True)
+            .distinct()
+            .order_by("zone_label")
+        )
+
+        return Response(
+            {
+                "location_id": str(location.id),
+                "name": location.name,
+                "storage_type": location.storage_type,
+                "is_active": location.is_active,
+                "items_count": items_count,
+                "stock_value": str(stock_value),
+                "stockout_count": stockout_count,
+                "critical_count": critical_count,
+                "movements_today": movements_today,
+                "movements_week": movements_week,
+                "zones": zones,
+                "zones_count": len(zones),
+                "capacity_m2": (
+                    str(location.capacity_m2) if location.capacity_m2 else None
+                ),
+                "capacity_percent": None,
+                "has_coordinates": bool(location.latitude and location.longitude),
+            }
+        )
+
+    @action(detail=True, methods=["get"], url_path="zones")
+    def zones(self, request, pk=None):
+        """Liste des zones utilisées dans ce lieu avec stock agrégé."""
+        location = self.get_object()
+
+        zones_data = (
+            StockBalance.objects.filter(storage_location=location)
+            .values("zone_label")
+            .annotate(
+                items_count=Count("item", distinct=True),
+                total_quantity=Coalesce(
+                    Sum("quantity"),
+                    Value(
+                        Decimal("0"),
+                        output_field=DecimalField(max_digits=14, decimal_places=3),
+                    ),
+                ),
+            )
+            .order_by("zone_label")
+        )
+
+        return Response(
+            {
+                "location_id": str(location.id),
+                "zones": [
+                    {
+                        "zone_label": z["zone_label"] or "",
+                        "zone_display": z["zone_label"] or "(Zone principale)",
+                        "items_count": z["items_count"],
+                        "total_quantity": str(z["total_quantity"]),
+                    }
+                    for z in zones_data
+                ],
+            }
+        )
 
 
 class UnitOfMeasureViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
@@ -633,7 +774,11 @@ class StockBalanceViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
         "item", "storage_location"
     ).all()
     serializer_class = StockBalanceSerializer
-    filterset_fields = ["item", "storage_location"]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ["item", "storage_location", "zone_label"]
+    search_fields = ["item__name", "item__sku", "zone_label"]
+    ordering_fields = ["quantity", "item__name", "updated_at"]
+    ordering = ["item__name"]
 
     def get_queryset(self):
         qs = super().get_queryset()

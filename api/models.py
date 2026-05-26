@@ -76,6 +76,27 @@ class StorageLocation(AuditedModel):
         default=StorageType.DEPOT_PRINCIPAL,
     )
     address = models.CharField(max_length=512, blank=True)
+    city = models.CharField(max_length=128, blank=True)
+    agency = models.ForeignKey(
+        "Agency",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="storage_locations",
+    )
+    project = models.ForeignKey(
+        "Project",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="storage_locations",
+    )
+    latitude = models.DecimalField(
+        max_digits=9, decimal_places=6, null=True, blank=True
+    )
+    longitude = models.DecimalField(
+        max_digits=9, decimal_places=6, null=True, blank=True
+    )
     manager_name = models.CharField(max_length=255, blank=True)
     manager_user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
