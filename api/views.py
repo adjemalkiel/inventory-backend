@@ -771,7 +771,7 @@ class ItemViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
 class StockBalanceViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, access.StockBalanceAccess]
     queryset = StockBalance.objects.select_related(
-        "item", "storage_location"
+        "item", "item__category", "item__unit", "storage_location"
     ).all()
     serializer_class = StockBalanceSerializer
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]

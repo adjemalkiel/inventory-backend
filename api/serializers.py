@@ -700,11 +700,38 @@ class StockBalanceSerializer(serializers.ModelSerializer):
     storage_location_name = serializers.CharField(
         source="storage_location.name", read_only=True
     )
+    item_name = serializers.CharField(source="item.name", read_only=True)
+    item_sku = serializers.CharField(source="item.sku", read_only=True)
+    item_category_name = serializers.CharField(
+        source="item.category.name", read_only=True, allow_null=True
+    )
+    item_unit_name = serializers.CharField(
+        source="item.unit.name", read_only=True, allow_null=True
+    )
+    item_unit_price = serializers.DecimalField(
+        source="item.unit_price",
+        max_digits=14,
+        decimal_places=2,
+        read_only=True,
+        allow_null=True,
+    )
+    item_min_stock = serializers.DecimalField(
+        source="item.min_stock",
+        max_digits=14,
+        decimal_places=3,
+        read_only=True,
+    )
 
     class Meta:
         model = StockBalance
         fields = [f.name for f in StockBalance._meta.fields] + [
             "storage_location_name",
+            "item_name",
+            "item_sku",
+            "item_category_name",
+            "item_unit_name",
+            "item_unit_price",
+            "item_min_stock",
         ]
         read_only_fields = AUDITED_READ_ONLY
 
@@ -885,6 +912,12 @@ class StockMovementSerializer(serializers.ModelSerializer):
     project_name = serializers.CharField(
         source="project.name", read_only=True, allow_null=True
     )
+    project_reference = serializers.CharField(
+        source="project.reference", read_only=True, allow_null=True
+    )
+    project_status = serializers.CharField(
+        source="project.status", read_only=True, allow_null=True
+    )
     created_by_name = serializers.SerializerMethodField()
     approved_by_name = serializers.SerializerMethodField()
 
@@ -896,6 +929,8 @@ class StockMovementSerializer(serializers.ModelSerializer):
             "source_storage_location_name",
             "destination_storage_location_name",
             "project_name",
+            "project_reference",
+            "project_status",
             "created_by_name",
             "approved_by_name",
         ]
