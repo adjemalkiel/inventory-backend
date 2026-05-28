@@ -51,13 +51,16 @@ from .models import (
     RolePermission,
     Site,
     StockBalance,
+    StockCostLayer,
     StockMovement,
+    StockValuationMethod,
     StorageLocation,
     Supplier,
     UnitOfMeasure,
     UserProfile,
     UserRole,
 )
+from . import valuation
 from .mail import (
     send_password_reset_email,
     send_password_reset_success_email,
@@ -209,6 +212,72 @@ def _apply_movement_to_balances(movement: StockMovement) -> None:
         balance.quantity += qty
         balance.updated_by = audit_user
         balance.save(update_fields=["quantity", "updated_at", "updated_by"])
+
+    _apply_movement_to_cost_layers(movement)
+
+
+def _apply_movement_to_cost_layers(movement: StockMovement) -> None:
+    """
+    Met à jour le registre de couches de coût (`StockCostLayer`) et fige
+    `unit_price_at_movement` / `total_cost` pour les mouvements sortants,
+    selon la méthode de valorisation active (Section 7).
+
+    Les transferts inter-sites n'ont aucun effet sur le registre.
+    """
+    method = valuation._active_method()
+    mtype = movement.movement_type
+
+    if mtype == StockMovement.MovementType.ENTREE:
+        price = movement.unit_price_at_movement
+        if price is None:
+            price = movement.item.unit_price or Decimal("0")
+        valuation.open_layer(movement, price)
+        if movement.unit_price_at_movement is not None:
+            movement.item.unit_price = movement.unit_price_at_movement
+            movement.item.save(update_fields=["unit_price", "updated_at"])
+        return
+
+    if mtype == StockMovement.MovementType.RETOUR:
+        valuation.open_layer(
+            movement, valuation._weighted_average_cost(movement.item)
+        )
+        return
+
+    if mtype == StockMovement.MovementType.AJUSTEMENT:
+        if movement.destination_storage_location_id:
+            valuation.open_layer(
+                movement, movement.item.unit_price or Decimal("0")
+            )
+            return
+        if movement.source_storage_location_id:
+            unit_cost = valuation.resolve_outgoing_unit_cost(
+                movement.item, movement.quantity, method
+            )
+            movement.unit_price_at_movement = unit_cost
+            movement.total_cost = unit_cost * movement.quantity
+            movement.save(
+                update_fields=[
+                    "unit_price_at_movement",
+                    "total_cost",
+                    "updated_at",
+                ]
+            )
+        return
+
+    if mtype == StockMovement.MovementType.SORTIE:
+        unit_cost = valuation.resolve_outgoing_unit_cost(
+            movement.item, movement.quantity, method
+        )
+        movement.unit_price_at_movement = unit_cost
+        movement.total_cost = unit_cost * movement.quantity
+        movement.save(
+            update_fields=[
+                "unit_price_at_movement",
+                "total_cost",
+                "updated_at",
+            ]
+        )
+        return
 
 
 def _issue_password_reset_for_user(*, user, request) -> tuple[bool, str]:
@@ -748,6 +817,108 @@ class ItemViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
             }
         )
 
+    @action(detail=True, methods=["get"], url_path="price-history")
+    def price_history(self, request, pk=None):
+        """Historique des prix d'achat + CUMP courant (Section 7.3.8)."""
+        item = self.get_object()
+        qs = (
+            StockMovement.objects.filter(
+                item=item,
+                movement_type=StockMovement.MovementType.ENTREE,
+                unit_price_at_movement__isnull=False,
+            )
+            .select_related("item__supplier")
+            .order_by("-created_at")
+            .values(
+                "created_at",
+                "unit_price_at_movement",
+                "quantity",
+                "reference_number",
+            )
+        )
+        points = [
+            {
+                "date": p["created_at"].date().isoformat(),
+                "unit_price": str(p["unit_price_at_movement"]),
+                "quantity": str(p["quantity"]),
+                "reference": p["reference_number"],
+            }
+            for p in qs
+        ]
+        prices = [Decimal(pt["unit_price"]) for pt in points]
+        wac = valuation._weighted_average_cost(item)
+        return Response(
+            {
+                "item_id": str(item.id),
+                "current_price": (
+                    str(item.unit_price) if item.unit_price is not None else None
+                ),
+                "weighted_average_cost": str(wac),
+                "min_price": str(min(prices)) if prices else None,
+                "max_price": str(max(prices)) if prices else None,
+                "points": points,
+            }
+        )
+
+    @action(detail=False, methods=["get"], url_path="stock-valuation")
+    def stock_valuation(self, request):
+        """Inventaire valorisé (Section 7.3.9)."""
+        method = valuation._active_method()
+        rows: list[dict] = []
+        grand_total = Decimal("0")
+        layer_value_expr = Coalesce(
+            Sum(F("quantity_remaining") * F("unit_cost")),
+            _DECIMAL_ZERO_EXPR,
+        )
+        balance_qty_expr = Coalesce(
+            Sum("quantity"),
+            Value(
+                Decimal("0"),
+                output_field=DecimalField(max_digits=18, decimal_places=3),
+            ),
+        )
+        for item in Item.objects.filter(is_active=True).select_related(
+            "category"
+        ):
+            layer_val = StockCostLayer.objects.filter(
+                item=item, quantity_remaining__gt=0
+            ).aggregate(v=layer_value_expr)["v"]
+            total_qty = StockBalance.objects.filter(item=item).aggregate(
+                q=balance_qty_expr
+            )["q"]
+            if method == StockValuationMethod.LAST_PRICE:
+                value = total_qty * (item.unit_price or Decimal("0"))
+            else:
+                value = layer_val
+            if total_qty <= 0 and value <= 0:
+                continue
+            unit_cost = (
+                (value / total_qty).quantize(Decimal("0.01"))
+                if total_qty > 0
+                else Decimal("0")
+            )
+            grand_total += value
+            rows.append(
+                {
+                    "item_id": str(item.id),
+                    "name": item.name,
+                    "sku": item.sku,
+                    "category_name": (
+                        item.category.name if item.category_id else None
+                    ),
+                    "total_quantity": str(total_qty),
+                    "unit_cost": str(unit_cost),
+                    "value": str(value),
+                }
+            )
+        return Response(
+            {
+                "method": method,
+                "grand_total": str(grand_total),
+                "items": rows,
+            }
+        )
+
     @action(
         detail=True,
         methods=["post"],
@@ -800,6 +971,176 @@ class StockBalanceViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
         return qs
 
 
+_DECIMAL_ZERO_EXPR = Value(
+    Decimal("0"), output_field=DecimalField(max_digits=18, decimal_places=2)
+)
+
+
+def _resource_estimated_cost(resource: ProjectResource) -> Decimal:
+    if resource.unit_cost is None:
+        return Decimal("0")
+    if (
+        resource.cost_unit == ProjectResource.CostUnit.FORFAIT
+        or not resource.planned_duration
+    ):
+        return resource.unit_cost
+    return resource.unit_cost * resource.planned_duration
+
+
+def _compute_project_costs(project: Project) -> dict:
+    """
+    Consolide les postes de coût d'un chantier (Section 7.3.6).
+
+    Renvoie un dict avec les montants en str (compatible JSON / DRF), prêt à
+    être enrichi par `_budget_vs_actual_by_category` pour l'endpoint
+    `cost-breakdown/`.
+    """
+    Z = Decimal("0")
+
+    def _sum(qs, field):
+        return qs.aggregate(t=Coalesce(Sum(field), _DECIMAL_ZERO_EXPR))["t"]
+
+    completed = StockMovement.objects.filter(
+        project=project,
+        status=StockMovement.MovementStatus.COMPLETED,
+    )
+    cost_materials = _sum(
+        completed.filter(movement_type=StockMovement.MovementType.SORTIE),
+        "total_cost",
+    )
+    cost_losses = _sum(
+        completed.filter(
+            movement_type=StockMovement.MovementType.AJUSTEMENT,
+            source_storage_location__isnull=False,
+        ),
+        "total_cost",
+    )
+
+    resources = ProjectResource.objects.filter(project=project)
+    cost_labour = Z
+    cost_subcontracting = Z
+    cost_rental = Z
+    for r in resources:
+        c = _resource_estimated_cost(r)
+        if r.resource_kind == ProjectResource.ResourceKind.MAIN_OEUVRE:
+            cost_labour += c
+        elif r.resource_kind == ProjectResource.ResourceKind.SUBCONTRACT:
+            cost_subcontracting += c
+        elif r.resource_kind == ProjectResource.ResourceKind.EQUIPMENT:
+            cost_rental += c
+
+    lines = ProjectBudgetLine.objects.filter(project=project)
+    cost_overhead = Z
+    overhead_categories = (
+        ProjectBudgetLine.CostCategory.FRAIS_GENERAUX,
+        ProjectBudgetLine.CostCategory.LOGISTIQUE,
+    )
+    for line in lines.filter(category__in=overhead_categories):
+        cost_overhead += (
+            line.actual_amount
+            if line.actual_amount is not None
+            else line.budget_amount
+        )
+
+    cost_total = (
+        cost_materials
+        + cost_losses
+        + cost_labour
+        + cost_subcontracting
+        + cost_rental
+        + cost_overhead
+    )
+
+    budget_total = project.budget_amount or _sum(lines, "budget_amount")
+    contract = project.contract_value
+    margin = (contract - cost_total) if contract is not None else None
+    margin_percent = (
+        round(float(margin) / float(contract) * 100, 1)
+        if contract is not None and contract > 0 and margin is not None
+        else None
+    )
+    budget_consumed_percent = None
+    if budget_total and budget_total > 0:
+        budget_consumed_percent = round(
+            float(cost_total) / float(budget_total) * 100, 1
+        )
+
+    return {
+        "project_id": str(project.id),
+        "currency": project.currency,
+        "cost_materials": str(cost_materials),
+        "cost_losses": str(cost_losses),
+        "cost_labour": str(cost_labour),
+        "cost_subcontracting": str(cost_subcontracting),
+        "cost_rental": str(cost_rental),
+        "cost_overhead": str(cost_overhead),
+        "cost_total": str(cost_total),
+        "budget_total": str(budget_total),
+        "budget_consumed_percent": budget_consumed_percent,
+        "contract_value": (
+            str(contract) if contract is not None else None
+        ),
+        "margin": str(margin) if margin is not None else None,
+        "margin_percent": margin_percent,
+    }
+
+
+def _budget_vs_actual_by_category(project: Project) -> list[dict]:
+    """
+    Calcule budget vs réalisé par catégorie de coût (Section 7.3.7).
+
+    Le réalisé `materiaux` est dérivé des sorties `completed` (non stocké).
+    Les autres catégories utilisent `ProjectBudgetLine.actual_amount` si
+    saisi, sinon 0. Retourne uniquement les catégories ayant un budget ou
+    un réalisé non nul.
+    """
+    from collections import defaultdict
+
+    Z = Decimal("0")
+
+    materials_actual = (
+        StockMovement.objects.filter(
+            project=project,
+            status=StockMovement.MovementStatus.COMPLETED,
+            movement_type=StockMovement.MovementType.SORTIE,
+        ).aggregate(t=Coalesce(Sum("total_cost"), _DECIMAL_ZERO_EXPR))["t"]
+    )
+
+    budget_by_cat = defaultdict(lambda: Z)
+    actual_by_cat = defaultdict(lambda: Z)
+    for line in ProjectBudgetLine.objects.filter(project=project):
+        budget_by_cat[line.category] += line.budget_amount or Z
+        if line.actual_amount is not None:
+            actual_by_cat[line.category] += line.actual_amount
+    # Le réalisé matériaux est dérivé des mouvements (override).
+    actual_by_cat[ProjectBudgetLine.CostCategory.MATERIAUX] = materials_actual
+
+    rows = []
+    for cat, label in ProjectBudgetLine.CostCategory.choices:
+        b = budget_by_cat.get(cat, Z)
+        a = actual_by_cat.get(cat, Z)
+        if b == Z and a == Z:
+            continue
+        variance = b - a
+        variance_percent = (
+            round(float(a) / float(b) * 100, 1) if b > 0 else None
+        )
+        rows.append(
+            {
+                "category": cat,
+                "label": label,
+                "budget": str(b),
+                "actual": str(a),
+                "variance": str(variance),
+                "variance_percent": variance_percent,
+                "over_budget": a > b,
+                "auto_actual": cat
+                == ProjectBudgetLine.CostCategory.MATERIAUX,
+            }
+        )
+    return rows
+
+
 class ProjectViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, access.AgencyProjectScopeAccess]
     queryset = (
@@ -834,6 +1175,14 @@ class ProjectViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     def get_queryset(self):
         qs = super().get_queryset()
         return access.project_queryset_for_user(self.request.user, qs)
+
+    @action(detail=True, methods=["get"], url_path="cost-breakdown")
+    def cost_breakdown(self, request, pk=None):
+        """Détail complet du coût d'un chantier (Section 7.3.6)."""
+        project = self.get_object()
+        data = _compute_project_costs(project)
+        data["by_category"] = _budget_vs_actual_by_category(project)
+        return Response(data)
 
     @action(detail=True, methods=["get"], url_path="summary")
     def summary(self, request, pk=None):
@@ -884,6 +1233,8 @@ class ProjectViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
                 float(cost_materials) / float(reference_budget) * 100, 1
             )
 
+        costs = _compute_project_costs(project)
+
         return Response(
             {
                 "project_id": str(project.id),
@@ -905,12 +1256,15 @@ class ProjectViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
                 "items_assigned": items_assigned,
                 "storage_locations_count": storage_locations_count,
                 "phases_count": project.phases.count(),
-                # Section 7 alimentera ces champs.
-                "cost_labour": None,
-                "cost_subcontracting": None,
-                "cost_rental": None,
-                "cost_total": None,
-                "margin_percent": None,
+                # Section 7 — postes de coût consolidés.
+                "cost_labour": costs["cost_labour"],
+                "cost_subcontracting": costs["cost_subcontracting"],
+                "cost_rental": costs["cost_rental"],
+                "cost_losses": costs["cost_losses"],
+                "cost_overhead": costs["cost_overhead"],
+                "cost_total": costs["cost_total"],
+                "margin": costs["margin"],
+                "margin_percent": costs["margin_percent"],
             }
         )
 
@@ -953,6 +1307,11 @@ class ProjectResourceViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, access.AgencyProjectScopeAccess]
     queryset = ProjectResource.objects.select_related("project").all()
     serializer_class = ProjectResourceSerializer
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ["project", "resource_kind"]
+    search_fields = ["name", "status_label", "notes"]
+    ordering_fields = ["resource_kind", "name", "availability_date"]
+    ordering = ["resource_kind", "name"]
 
     def get_queryset(self):
         qs = super().get_queryset().select_related("project")

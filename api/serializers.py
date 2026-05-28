@@ -783,10 +783,32 @@ class ProjectSerializer(serializers.ModelSerializer):
 
 
 class ProjectResourceSerializer(serializers.ModelSerializer):
+    resource_kind_label = serializers.CharField(
+        source="get_resource_kind_display", read_only=True
+    )
+    cost_unit_label = serializers.CharField(
+        source="get_cost_unit_display", read_only=True
+    )
+    estimated_cost = serializers.SerializerMethodField()
+
     class Meta:
         model = ProjectResource
-        fields = "__all__"
+        fields = [f.name for f in ProjectResource._meta.fields] + [
+            "resource_kind_label",
+            "cost_unit_label",
+            "estimated_cost",
+        ]
         read_only_fields = AUDITED_READ_ONLY
+
+    def get_estimated_cost(self, obj: ProjectResource):
+        if obj.unit_cost is None:
+            return None
+        if (
+            obj.cost_unit == ProjectResource.CostUnit.FORFAIT
+            or not obj.planned_duration
+        ):
+            return str(obj.unit_cost)
+        return str(obj.unit_cost * obj.planned_duration)
 
 
 class ProjectPhaseSerializer(serializers.ModelSerializer):
@@ -980,6 +1002,16 @@ class StockMovementSerializer(serializers.ModelSerializer):
             loss_reason = inst.loss_reason
 
         attrs.pop("total_cost", None)
+
+        # Section 7 — Le prix unitaire des sorties (et ajustement perte) est
+        # calculé par le moteur de valorisation (CUMP / FIFO / dernier prix),
+        # pas par le client. On l'ignore silencieusement si fourni.
+        if movement_type in (
+            StockMovement.MovementType.SORTIE,
+            StockMovement.MovementType.AJUSTEMENT,
+            StockMovement.MovementType.TRANSFERT,
+        ):
+            attrs.pop("unit_price_at_movement", None)
 
         if movement_type in (
             StockMovement.MovementType.SORTIE,

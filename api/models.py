@@ -1,4 +1,5 @@
 import uuid
+from decimal import Decimal
 
 from django.conf import settings
 from django.db import models
@@ -551,6 +552,12 @@ class ProjectResource(AuditedModel):
     class ResourceKind(models.TextChoices):
         EQUIPMENT = "equipment", "Matériel"
         SUBCONTRACT = "subcontract", "Sous-traitance"
+        MAIN_OEUVRE = "main_oeuvre", "Main d'œuvre"
+
+    class CostUnit(models.TextChoices):
+        JOUR = "jour", "par Jour"
+        HEURE = "heure", "par Heure"
+        FORFAIT = "forfait", "Forfait"
 
     project = models.ForeignKey(
         Project,
@@ -566,6 +573,29 @@ class ProjectResource(AuditedModel):
     availability_date = models.DateField(null=True, blank=True)
     headcount = models.PositiveIntegerField(null=True, blank=True)
     status_label = models.CharField(max_length=128, blank=True)
+    unit_cost = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text=(
+            "FCFA/jour (matériel), FCFA/h (MO), FCFA forfait (sous-traitance)."
+        ),
+    )
+    cost_unit = models.CharField(
+        max_length=16,
+        choices=CostUnit.choices,
+        blank=True,
+    )
+    planned_duration = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Durée planifiée (jours ou heures selon cost_unit).",
+    )
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["project", "resource_kind", "name"]
 
     def __str__(self) -> str:
         return f"{self.name} ({self.project.reference})"
@@ -719,12 +749,75 @@ class ItemProjectAssignment(AuditedModel):
         return f"{self.item.sku} → {self.project.reference}"
 
 
+class StockValuationMethod(models.TextChoices):
+    LAST_PRICE = "last_price", "Dernier prix d'achat connu"
+    WAC = "wac", "Coût moyen pondéré (CUMP)"
+    FIFO = "fifo", "FIFO / PEPS (Premier entré, premier sorti)"
+
+
+class StockCostLayer(AuditedModel):
+    """
+    Couche de coût d'un article (registre FIFO / CUMP).
+
+    Une couche est ouverte par chaque mouvement entrant costé
+    (`entree`, `retour`, `ajustement` surplus) et consommée
+    (`quantity_remaining` décrémentée) par les mouvements sortants
+    (`sortie`, `ajustement` perte). Granularité : par article (niveau
+    entreprise), pas par emplacement. Les transferts inter-sites n'ont
+    aucun effet sur le registre.
+    """
+
+    item = models.ForeignKey(
+        Item,
+        on_delete=models.CASCADE,
+        related_name="cost_layers",
+    )
+    source_movement = models.ForeignKey(
+        "StockMovement",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="opened_cost_layers",
+    )
+    unit_cost = models.DecimalField(max_digits=14, decimal_places=2)
+    quantity_in = models.DecimalField(max_digits=14, decimal_places=3)
+    quantity_remaining = models.DecimalField(max_digits=14, decimal_places=3)
+    occurred_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["item", "occurred_at"]
+        indexes = [models.Index(fields=["item", "occurred_at"])]
+
+    def __str__(self) -> str:
+        return (
+            f"{self.item.sku} · {self.quantity_remaining}/{self.quantity_in}"
+            f" @ {self.unit_cost}"
+        )
+
+
 class OrganizationSettings(AuditedModel):
     """Singleton-style app settings (use one row, e.g. pk=1)."""
 
     global_low_stock_threshold_percent = models.PositiveSmallIntegerField(
         default=15,
         help_text="Notify when stock falls below this percentage of capacity.",
+    )
+    stock_valuation_method = models.CharField(
+        max_length=16,
+        choices=StockValuationMethod.choices,
+        default=StockValuationMethod.WAC,
+        help_text=(
+            "Méthode de valorisation des sorties de stock vers les chantiers."
+        ),
+    )
+    default_currency = models.CharField(max_length=8, default="XOF")
+    vat_rate_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal("0"),
+        help_text=(
+            "Taux de TVA par défaut appliqué aux coûts (0 = désactivé)."
+        ),
     )
     expiry_alert_days_before = models.PositiveIntegerField(default=30)
     expiry_alerts_enabled = models.BooleanField(default=False)
