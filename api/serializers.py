@@ -835,15 +835,40 @@ class ProjectPhaseSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, attrs):
-        start = attrs.get("start_date") or (
-            self.instance.start_date if self.instance else None
-        )
+        # Règle 1 : status termine → force progress_percent à 100
+        if attrs.get("status") == "termine":
+            attrs["progress_percent"] = 100
+
+        # Règle 2 : progress_percent 100 → bascule status sur termine
+        if attrs.get("progress_percent") == 100 and attrs.get("status") not in ("termine",):
+            attrs["status"] = "termine"
+
+        # Règle 3 : end_date dépassée ET status != termine → en_retard
+        from django.utils import timezone as tz
+
         end = attrs.get("end_date") or (
             self.instance.end_date if self.instance else None
+        )
+        status_val = attrs.get("status") or (
+            self.instance.status if self.instance else None
+        )
+        if end and end < tz.now().date() and status_val not in ("termine", "en_retard"):
+            attrs["status"] = "en_retard"
+
+        # Validation date de début < date de fin
+        start = attrs.get("start_date") or (
+            self.instance.start_date if self.instance else None
         )
         if start and end and end < start:
             raise serializers.ValidationError(
                 {"end_date": "La date de fin doit être postérieure à la date de début."}
+            )
+
+        # Règle 4 : progress_percent entre 0 et 100
+        pct = attrs.get("progress_percent")
+        if pct is not None and not (0 <= pct <= 100):
+            raise serializers.ValidationError(
+                {"progress_percent": "La valeur doit être entre 0 et 100."}
             )
         return attrs
 

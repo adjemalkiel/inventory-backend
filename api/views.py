@@ -1172,9 +1172,36 @@ class ProjectViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     ]
     ordering = ["-created_at"]
 
+    ALLOWED_TRANSITIONS = {
+        "brouillon":     {"planification", "annule"},
+        "planification": {"en_cours", "brouillon", "annule"},
+        "en_cours":      {"suspendu", "termine"},
+        "suspendu":      {"en_cours", "annule"},
+        "termine":       set(),   # terminal
+        "annule":        set(),   # terminal
+    }
+
     def get_queryset(self):
         qs = super().get_queryset()
         return access.project_queryset_for_user(self.request.user, qs)
+
+    def partial_update(self, request, *args, **kwargs):
+        project = self.get_object()
+        new_status = request.data.get("status")
+
+        if new_status and new_status != project.status:
+            allowed = self.ALLOWED_TRANSITIONS.get(project.status, set())
+            if new_status not in allowed:
+                return Response(
+                    {
+                        "status": (
+                            f"Transition « {project.status} » → « {new_status} » non autorisée. "
+                            f"Transitions valides : {sorted(allowed) or 'aucune (statut terminal)'}."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        return super().partial_update(request, *args, **kwargs)
 
     @action(detail=True, methods=["get"], url_path="cost-breakdown")
     def cost_breakdown(self, request, pk=None):
@@ -1284,6 +1311,34 @@ class ProjectPhaseViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
             self.request.user, Project.objects.all()
         )
         return qs.filter(project_id__in=pqs.values_list("id", flat=True))
+
+    def perform_update(self, serializer):
+        phase = serializer.save(updated_by=self.request.user)
+        self._sync_project_progress(phase.project)
+
+    def perform_create(self, serializer):
+        phase = serializer.save(
+            created_by=self.request.user,
+            updated_by=self.request.user,
+        )
+        self._sync_project_progress(phase.project)
+
+    def perform_destroy(self, instance):
+        project = instance.project
+        instance.delete()
+        self._sync_project_progress(project)
+
+    @staticmethod
+    def _sync_project_progress(project):
+        """Recalcule project.progress_percent = moyenne des phases."""
+        phases = list(project.phases.values_list("progress_percent", flat=True))
+        if not phases:
+            return
+        avg = round(sum(phases) / len(phases))
+        Project.objects.filter(pk=project.pk).update(
+            progress_percent=avg,
+            updated_at=timezone.now(),
+        )
 
 
 class ProjectBudgetLineViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
