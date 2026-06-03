@@ -842,11 +842,96 @@ class OrganizationSettings(AuditedModel):
         help_text="Adresse d’expéditeur pour l’e-mail (sinon paramètre par défaut du serveur).",
     )
 
+
+    # Alertes -- canaux
+    email_alerts_enabled = models.BooleanField(default=True,
+        help_text="Envoyer un email pour les alertes de sévérité critique.")
+    notification_email = models.EmailField(blank=True,
+        help_text="Email destinataire des alertes critiques (vide = email de l'org).")
+
+    # Alertes -- seuils configurables
+    pending_approval_threshold_hours = models.PositiveSmallIntegerField(default=24,
+        help_text="Durée (heures) avant alerte pour un mouvement en attente d'approbation.")
+    inventory_gap_min_cost = models.DecimalField(max_digits=14, decimal_places=2,
+        default=Decimal("50000"),
+        help_text="Seuil minimal (FCFA) d'un ajustement perte pour déclencher une alerte.")
+    inventory_gap_min_qty_percent = models.PositiveSmallIntegerField(default=10,
+        help_text="Seuil minimal (% du stock) d'un ajustement perte pour déclencher une alerte.")
+    abnormal_movement_threshold = models.DecimalField(max_digits=14, decimal_places=2,
+        default=Decimal("500000"),
+        help_text="Valeur minimale (FCFA) d'une sortie pour déclencher une alerte mouvement élevé.")
+    new_delivery_alerts_enabled = models.BooleanField(default=True,
+        help_text="Générer une alerte (info) à chaque nouvelle livraison réceptionnée.")
+
     class Meta:
         verbose_name_plural = "Organization settings"
 
     def __str__(self) -> str:
         return "Organization settings"
+
+
+class Alert(AuditedModel):
+    """Alerte persistante générée par le moteur alert_engine.
+    Une alerte représente une situation anormale a un instant T.
+    Elle est dédupliquée par fingerprint : une seule alerte active par situation.
+    """
+
+    class AlertType(models.TextChoices):
+        LOW_STOCK        = "low_stock",        "Stock bas"
+        STOCKOUT         = "stockout",         "Rupture de stock"
+        BUDGET_OVERRUN   = "budget_overrun",   "Dépassement de budget"
+        NEW_DELIVERY     = "new_delivery",     "Nouvelle livraison"
+        PENDING_APPROVAL = "pending_approval", "Validation en attente"
+        INVENTORY_GAP    = "inventory_gap",    "Écart d'inventaire"
+        ABNORMAL_MOVEMENT= "abnormal_movement","Mouvement élevé"
+
+    class Severity(models.TextChoices):
+        CRITICAL = "critical", "Critique"
+        WARNING  = "warning",  "Avertissement"
+        INFO     = "info",     "Information"
+
+    class Status(models.TextChoices):
+        UNREAD   = "unread",    "Non lue"
+        READ     = "read",      "Lue"
+        DISMISSED= "dismissed", "Ignorée"
+        RESOLVED = "resolved",  "Résolue automatiquement"
+
+    alert_type  = models.CharField(max_length=32, choices=AlertType.choices)
+    severity    = models.CharField(max_length=16, choices=Severity.choices)
+    status      = models.CharField(max_length=16, choices=Status.choices,
+                                   default=Status.UNREAD)
+    title       = models.CharField(max_length=255)
+    message     = models.TextField()
+
+    item            = models.ForeignKey(
+        "Item", null=True, blank=True,
+        on_delete=models.CASCADE, related_name="alerts")
+    project         = models.ForeignKey(
+        "Project", null=True, blank=True,
+        on_delete=models.CASCADE, related_name="alerts")
+    stock_movement  = models.ForeignKey(
+        "StockMovement", null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="alerts")
+
+    fingerprint = models.CharField(max_length=128, db_index=True)
+
+    email_sent    = models.BooleanField(default=False)
+    email_sent_at = models.DateTimeField(null=True, blank=True)
+
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["status", "created_at"]),
+            models.Index(fields=["alert_type", "status"]),
+            models.Index(fields=["fingerprint", "status"]),
+        ]
+
+    def __str__(self):
+        return f"[{self.severity}] {self.title}"
+
+
 
 
 class Integration(AuditedModel):

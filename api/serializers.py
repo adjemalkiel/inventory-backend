@@ -9,6 +9,7 @@ from . import rbac
 from .models import (
     ActivityEvent,
     Agency,
+    Alert,
     ApprovalRule,
     Category,
     Integration,
@@ -1238,3 +1239,28 @@ class ActivityEventSerializer(serializers.ModelSerializer):
         model = ActivityEvent
         fields = "__all__"
         read_only_fields = AUDITED_READ_ONLY
+
+
+class AlertSerializer(serializers.ModelSerializer):
+    alert_type_label = serializers.CharField(
+        source="get_alert_type_display", read_only=True)
+    severity_label = serializers.CharField(
+        source="get_severity_display", read_only=True)
+    status_label = serializers.CharField(
+        source="get_status_display", read_only=True)
+    item_name = serializers.CharField(
+        source="item.name", read_only=True, default=None)
+    project_name = serializers.CharField(
+        source="project.name", read_only=True, default=None)
+
+    class Meta:
+        model = Alert
+        fields = [
+            "id", "alert_type", "alert_type_label", "severity", "severity_label",
+            "status", "status_label", "title", "message",
+            "item", "item_name", "project", "project_name", "stock_movement",
+            "email_sent", "email_sent_at", "resolved_at",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "fingerprint", "email_sent", "email_sent_at",
+                            "resolved_at", "created_at", "updated_at"]

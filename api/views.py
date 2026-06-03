@@ -36,6 +36,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from .models import (
     ActivityEvent,
     Agency,
+    Alert,
     ApprovalRule,
     Category,
     Integration,
@@ -61,6 +62,7 @@ from .models import (
     UserRole,
 )
 from . import valuation
+from . import alert_engine
 from .mail import (
     send_password_reset_email,
     send_password_reset_success_email,
@@ -69,11 +71,13 @@ from .mail import (
 )
 from . import access, rbac
 from . import scope as user_scope
+from . import project_costs as pcosts
 from .filters import ApprovalRuleFilter, ItemFilter, StockMovementFilter
 from .permissions import IsAdminRole
 from .serializers import (
     ActivityEventSerializer,
     AgencySerializer,
+    AlertSerializer,
     ApprovalRuleSerializer,
     CategorySerializer,
     ChangePasswordSerializer,
@@ -167,6 +171,8 @@ def _apply_movement_to_balances(movement: StockMovement) -> None:
             balance.quantity += qty
         balance.updated_by = audit_user
         balance.save(update_fields=["quantity", "updated_at", "updated_by"])
+        # --- Alertes pour ajustement ---
+        _trigger_alerts_for_movement(movement)
         return
 
     qty = movement.quantity
@@ -214,6 +220,8 @@ def _apply_movement_to_balances(movement: StockMovement) -> None:
         balance.save(update_fields=["quantity", "updated_at", "updated_by"])
 
     _apply_movement_to_cost_layers(movement)
+    # --- Alertes ---
+    _trigger_alerts_for_movement(movement)
 
 
 def _apply_movement_to_cost_layers(movement: StockMovement) -> None:
@@ -278,6 +286,30 @@ def _apply_movement_to_cost_layers(movement: StockMovement) -> None:
             ]
         )
         return
+
+
+def _trigger_alerts_for_movement(movement: StockMovement) -> None:
+    """
+    Declenche les alertes pertinentes apres completion d'un mouvement.
+    Les alertes ne doivent jamais bloquer la transaction principale.
+    """
+    try:
+        alert_engine.check_stock_alerts(movement.item)
+
+        if movement.movement_type == StockMovement.MovementType.ENTREE:
+            alert_engine.generate_new_delivery_alert(movement)
+
+        elif movement.movement_type == StockMovement.MovementType.SORTIE:
+            alert_engine.generate_abnormal_movement_alert(movement)
+            if movement.project:
+                alert_engine.check_budget_alert(movement.project)
+
+        elif (movement.movement_type == StockMovement.MovementType.AJUSTEMENT
+              and movement.source_storage_location):
+            alert_engine.generate_inventory_gap_alert(movement)
+
+    except Exception:
+        pass
 
 
 def _issue_password_reset_for_user(*, user, request) -> tuple[bool, str]:
@@ -988,101 +1020,8 @@ def _resource_estimated_cost(resource: ProjectResource) -> Decimal:
 
 
 def _compute_project_costs(project: Project) -> dict:
-    """
-    Consolide les postes de coût d'un chantier (Section 7.3.6).
-
-    Renvoie un dict avec les montants en str (compatible JSON / DRF), prêt à
-    être enrichi par `_budget_vs_actual_by_category` pour l'endpoint
-    `cost-breakdown/`.
-    """
-    Z = Decimal("0")
-
-    def _sum(qs, field):
-        return qs.aggregate(t=Coalesce(Sum(field), _DECIMAL_ZERO_EXPR))["t"]
-
-    completed = StockMovement.objects.filter(
-        project=project,
-        status=StockMovement.MovementStatus.COMPLETED,
-    )
-    cost_materials = _sum(
-        completed.filter(movement_type=StockMovement.MovementType.SORTIE),
-        "total_cost",
-    )
-    cost_losses = _sum(
-        completed.filter(
-            movement_type=StockMovement.MovementType.AJUSTEMENT,
-            source_storage_location__isnull=False,
-        ),
-        "total_cost",
-    )
-
-    resources = ProjectResource.objects.filter(project=project)
-    cost_labour = Z
-    cost_subcontracting = Z
-    cost_rental = Z
-    for r in resources:
-        c = _resource_estimated_cost(r)
-        if r.resource_kind == ProjectResource.ResourceKind.MAIN_OEUVRE:
-            cost_labour += c
-        elif r.resource_kind == ProjectResource.ResourceKind.SUBCONTRACT:
-            cost_subcontracting += c
-        elif r.resource_kind == ProjectResource.ResourceKind.EQUIPMENT:
-            cost_rental += c
-
-    lines = ProjectBudgetLine.objects.filter(project=project)
-    cost_overhead = Z
-    overhead_categories = (
-        ProjectBudgetLine.CostCategory.FRAIS_GENERAUX,
-        ProjectBudgetLine.CostCategory.LOGISTIQUE,
-    )
-    for line in lines.filter(category__in=overhead_categories):
-        cost_overhead += (
-            line.actual_amount
-            if line.actual_amount is not None
-            else line.budget_amount
-        )
-
-    cost_total = (
-        cost_materials
-        + cost_losses
-        + cost_labour
-        + cost_subcontracting
-        + cost_rental
-        + cost_overhead
-    )
-
-    budget_total = project.budget_amount or _sum(lines, "budget_amount")
-    contract = project.contract_value
-    margin = (contract - cost_total) if contract is not None else None
-    margin_percent = (
-        round(float(margin) / float(contract) * 100, 1)
-        if contract is not None and contract > 0 and margin is not None
-        else None
-    )
-    budget_consumed_percent = None
-    if budget_total and budget_total > 0:
-        budget_consumed_percent = round(
-            float(cost_total) / float(budget_total) * 100, 1
-        )
-
-    return {
-        "project_id": str(project.id),
-        "currency": project.currency,
-        "cost_materials": str(cost_materials),
-        "cost_losses": str(cost_losses),
-        "cost_labour": str(cost_labour),
-        "cost_subcontracting": str(cost_subcontracting),
-        "cost_rental": str(cost_rental),
-        "cost_overhead": str(cost_overhead),
-        "cost_total": str(cost_total),
-        "budget_total": str(budget_total),
-        "budget_consumed_percent": budget_consumed_percent,
-        "contract_value": (
-            str(contract) if contract is not None else None
-        ),
-        "margin": str(margin) if margin is not None else None,
-        "margin_percent": margin_percent,
-    }
+    """Delegue au module partage project_costs."""
+    return pcosts.compute_project_costs(project)
 
 
 def _budget_vs_actual_by_category(project: Project) -> list[dict]:
@@ -1971,6 +1910,57 @@ class ActivityEventViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
         "created_by", "updated_by"
     ).all()
     serializer_class = ActivityEventSerializer
+
+
+class AlertViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Alertes en lecture seule.
+    Actions : read/, dismiss/, refresh/ (POST).
+    """
+    serializer_class = AlertSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    filterset_fields = ["status", "severity", "alert_type", "project", "item"]
+    ordering_fields = ["created_at", "severity"]
+    ordering = ["-created_at"]
+
+    def get_queryset(self):
+        return Alert.objects.select_related(
+            "item", "project", "stock_movement"
+        ).filter(
+            status__in=[Alert.Status.UNREAD, Alert.Status.READ]
+        )
+
+    @action(detail=False, methods=["get"], url_path="unread-count")
+    def unread_count(self, request):
+        count = Alert.objects.filter(status=Alert.Status.UNREAD).count()
+        return Response({"count": count})
+
+    @action(detail=True, methods=["post"], url_path="read")
+    def mark_read(self, request, pk=None):
+        alert = self.get_object()
+        if alert.status == Alert.Status.UNREAD:
+            alert.status = Alert.Status.READ
+            alert.save(update_fields=["status", "updated_at"])
+        return Response(AlertSerializer(alert).data)
+
+    @action(detail=True, methods=["post"], url_path="dismiss")
+    def dismiss(self, request, pk=None):
+        alert = self.get_object()
+        alert.status = Alert.Status.DISMISSED
+        alert.save(update_fields=["status", "updated_at"])
+        return Response(AlertSerializer(alert).data)
+
+    @action(detail=False, methods=["post"], url_path="mark-all-read")
+    def mark_all_read(self, request):
+        updated = Alert.objects.filter(
+            status=Alert.Status.UNREAD).update(status=Alert.Status.READ)
+        return Response({"updated": updated})
+
+    @action(detail=False, methods=["post"], url_path="refresh")
+    def refresh(self, request):
+        result = alert_engine.run_all()
+        return Response(result)
 
 
 def _set_refresh_cookie(response, refresh_value: str, *, persistent: bool) -> None:

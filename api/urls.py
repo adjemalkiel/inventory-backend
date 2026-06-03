@@ -85,6 +85,7 @@ router.register(
     views.ActivityEventViewSet,
     basename="activity-event",
 )
+router.register(r"alerts", views.AlertViewSet, basename="alert")
 
 urlpatterns = [
     path("auth/login/", views.auth_login, name="auth-login"),
