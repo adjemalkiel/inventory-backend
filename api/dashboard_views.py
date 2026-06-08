@@ -524,4 +524,52 @@ def dashboard_recent_movements(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def dashboard_cost_overview(request):
-    return Response(status=status.HTTP_501_NOT_IMPLEMENTED)
+    """
+    GET /api/v1/dashboard/cost-overview/
+    Agrège les coûts de tous les projets actifs pour le Dashboard.
+    """
+    from .project_costs import compute_project_costs
+
+    active_projects = Project.objects.filter(
+        status__in=["planifie", "en_cours"]
+    ).select_related("agency")
+
+    projects_data = []
+    total_budget = total_cost = total_contract = Decimal("0")
+
+    for project in active_projects:
+        costs = compute_project_costs(project)
+        ct = Decimal(costs["cost_total"])
+        bt = Decimal(costs["budget_total"])
+        cv = Decimal(costs["contract_value"]) if costs["contract_value"] else None
+        total_cost += ct
+        total_budget += bt
+        if cv:
+            total_contract += cv
+        projects_data.append({
+            "project_id": str(project.id),
+            "name": project.name,
+            "reference": project.reference,
+            "currency": project.currency,
+            "cost_total": str(ct),
+            "budget_total": str(bt),
+            "contract_value": str(cv) if cv else None,
+            "margin": costs["margin"],
+            "margin_percent": costs["margin_percent"],
+            "budget_consumed_percent": costs["budget_consumed_percent"],
+            "over_budget": ct > bt if bt > 0 else False,
+        })
+
+    global_margin = (total_contract - total_cost) if total_contract > 0 else None
+    return Response({
+        "total_budget": str(total_budget),
+        "total_cost": str(total_cost),
+        "total_contract_value": str(total_contract) if total_contract > 0 else None,
+        "global_margin": str(global_margin) if global_margin is not None else None,
+        "global_margin_percent": (
+            round(float(global_margin) / float(total_contract) * 100, 1)
+            if global_margin and total_contract > 0 else None
+        ),
+        "active_projects_count": len(projects_data),
+        "projects": projects_data,
+    })

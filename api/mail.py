@@ -90,6 +90,7 @@ def send_mail_via_org_settings(
     subject: str,
     html_body: str,
     recipient_list: list[str],
+    attachments: list[tuple[str, bytes, str]] | None = None,
 ) -> tuple[int, str]:
     """
     Send a **single-part HTML** e-mail (no text/plain) via a real SMTP server.
@@ -139,6 +140,9 @@ def send_mail_via_org_settings(
         connection=conn,
     )
     msg.content_subtype = "html"
+    if attachments:
+        for filename, content, mime in attachments:
+            msg.attach(filename, content, mime)
     n = msg.send(fail_silently=False)
     return n, kind
 

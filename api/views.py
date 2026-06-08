@@ -970,6 +970,34 @@ class ItemViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
         item.save(update_fields=["image_url", "updated_at"])
         return Response({"image_url": item.image_url})
 
+    @action(detail=False, methods=["get"], url_path="stock-valuation/export")
+    def stock_valuation_export(self, request):
+        """GET /api/v1/items/stock-valuation/export/ → Excel download."""
+        if not rbac.user_has_permission(request.user, "reports.financial"):
+            return Response({"detail": "Permission refusée."}, status=status.HTTP_403_FORBIDDEN)
+        from . import exports
+        data = _build_stock_valuation_data()
+        cfg = OrganizationSettings.objects.first()
+        currency = cfg.default_currency if cfg and hasattr(cfg, "default_currency") else "XOF"
+        return exports.export_stock_valuation(data, currency)
+
+    @action(detail=False, methods=["get"], url_path="critical-stock/export")
+    def critical_stock_export(self, request):
+        """GET /api/v1/items/critical-stock/export/ → CSV download."""
+        from . import exports
+        qs = (
+            Item.objects.filter(is_active=True)
+            .select_related("category")
+            .annotate(
+                total_stock=Coalesce(
+                    Sum("balances__quantity"),
+                    Value(Decimal("0"), output_field=DecimalField(max_digits=18, decimal_places=3)),
+                )
+            )
+        )
+        qs = qs.filter(Q(total_stock__lte=0) | Q(total_stock__lt=F("min_stock")))
+        return exports.export_critical_stock_csv(qs)
+
 
 class StockBalanceViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, access.StockBalanceAccess]
@@ -1149,6 +1177,17 @@ class ProjectViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
         data = _compute_project_costs(project)
         data["by_category"] = _budget_vs_actual_by_category(project)
         return Response(data)
+
+    @action(detail=True, methods=["get"], url_path="cost-breakdown/export")
+    def cost_breakdown_export(self, request, pk=None):
+        """GET /api/v1/projects/{id}/cost-breakdown/export/ → Excel download."""
+        if not rbac.user_has_permission(request.user, "reports.cost"):
+            return Response({"detail": "Permission refusée."}, status=status.HTTP_403_FORBIDDEN)
+        from . import exports
+        project = self.get_object()
+        costs = pcosts.compute_project_costs(project)
+        by_cat = _budget_vs_actual_by_category(project)
+        return exports.export_project_cost_breakdown(project, costs, by_cat)
 
     @action(detail=True, methods=["get"], url_path="summary")
     def summary(self, request, pk=None):
@@ -1471,6 +1510,45 @@ class StockMovementViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
                 context={"request": request},
             ).data
         )
+
+    @action(detail=False, methods=["get"], url_path="export")
+    def export(self, request):
+        """GET /api/v1/stock-movements/export/?date_from=&date_to=&movement_type=&project="""
+        from . import exports
+
+        qs = StockMovement.objects.filter(
+            status=StockMovement.MovementStatus.COMPLETED,
+        ).select_related(
+            "item", "item__unit", "item__category",
+            "source_storage_location", "destination_storage_location",
+            "project", "created_by",
+        ).order_by("-created_at")
+
+        date_from = request.query_params.get("date_from")
+        date_to = request.query_params.get("date_to")
+        movement_type = request.query_params.get("movement_type")
+        project_id = request.query_params.get("project")
+
+        if date_from:
+            qs = qs.filter(created_at__date__gte=date_from)
+        if date_to:
+            qs = qs.filter(created_at__date__lte=date_to)
+        if movement_type:
+            qs = qs.filter(movement_type=movement_type)
+        if project_id:
+            qs = qs.filter(project_id=project_id)
+
+        # For transfers-specific export
+        if movement_type == StockMovement.MovementType.TRANSFERT:
+            return exports.export_transfers(qs, {
+                "date_from": date_from or "",
+                "date_to": date_to or "",
+            })
+
+        return exports.export_movements(qs, {
+            "date_from": date_from or "",
+            "date_to": date_to or "",
+        })
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -2281,3 +2359,350 @@ def me_change_password(request):
     request.user.set_password(new)
     request.user.save(update_fields=["password"])
     return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section 9 — Rapports & Exports
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from datetime import date
+from django.db.models import Avg, Min, Max
+
+
+def _build_stock_valuation_data() -> dict:
+    """Shared helper: builds the stock valuation report data (used by JSON + export endpoints)."""
+    method = valuation._active_method()
+    rows: list[dict] = []
+    grand_total = Decimal("0")
+    layer_value_expr = Coalesce(
+        Sum(F("quantity_remaining") * F("unit_cost")),
+        Value(Decimal("0"), output_field=DecimalField(max_digits=18, decimal_places=2)),
+    )
+    balance_qty_expr = Coalesce(
+        Sum("quantity"),
+        Value(Decimal("0"), output_field=DecimalField(max_digits=18, decimal_places=3)),
+    )
+    for item in Item.objects.filter(is_active=True).select_related("category"):
+        layer_val = StockCostLayer.objects.filter(
+            item=item, quantity_remaining__gt=0
+        ).aggregate(v=layer_value_expr)["v"]
+        total_qty = StockBalance.objects.filter(item=item).aggregate(
+            q=balance_qty_expr
+        )["q"]
+        if method == StockValuationMethod.LAST_PRICE:
+            value = total_qty * (item.unit_price or Decimal("0"))
+        else:
+            value = layer_val
+        if total_qty <= 0 and value <= 0:
+            continue
+        unit_cost = (
+            (value / total_qty).quantize(Decimal("0.01"))
+            if total_qty > 0
+            else Decimal("0")
+        )
+        grand_total += value
+        rows.append({
+            "item_id": str(item.id),
+            "name": item.name,
+            "sku": item.sku,
+            "category_name": item.category.name if item.category_id else None,
+            "total_quantity": str(total_qty),
+            "unit_cost": str(unit_cost),
+            "value": str(value),
+        })
+    return {"method": method, "grand_total": str(grand_total), "items": rows}
+
+
+class ReportViewSet(viewsets.ViewSet):
+    """New endpoints for Section 9 reports."""
+
+    permission_classes = [IsAuthenticated]
+
+    @action(detail=False, methods=["get"], url_path="monthly-consumption")
+    def monthly_consumption(self, request):
+        """GET /api/v1/reports/monthly-consumption/?year=2026&project="""
+        if not rbac.user_has_permission(request.user, "reports.financial"):
+            return Response({"detail": "Permission refusée."}, status=status.HTTP_403_FORBIDDEN)
+
+        year = int(request.query_params.get("year", date.today().year))
+        project_id = request.query_params.get("project")
+
+        qs = StockMovement.objects.filter(
+            movement_type=StockMovement.MovementType.SORTIE,
+            status=StockMovement.MovementStatus.COMPLETED,
+            created_at__year=year,
+        ).select_related("item__category")
+
+        if project_id:
+            qs = qs.filter(project_id=project_id)
+
+        rows = (
+            qs.values("created_at__month", "item__category__name")
+            .annotate(total_cost=Sum("total_cost"), total_qty=Sum("quantity"))
+            .order_by("created_at__month", "item__category__name")
+        )
+
+        MONTH_LABELS = [
+            "", "Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
+            "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre",
+        ]
+        months_data: dict[int, dict] = {}
+        for row in rows:
+            m = row["created_at__month"]
+            if m not in months_data:
+                months_data[m] = {
+                    "month": m,
+                    "month_label": MONTH_LABELS[m],
+                    "by_category": [],
+                    "month_total": Decimal("0"),
+                }
+            tc = row["total_cost"] or Decimal("0")
+            months_data[m]["by_category"].append({
+                "category": row["item__category__name"] or "Sans catégorie",
+                "total_cost": str(tc),
+                "total_qty": str(row["total_qty"] or Decimal("0")),
+            })
+            months_data[m]["month_total"] += tc
+
+        result = sorted(months_data.values(), key=lambda x: x["month"])
+        for m in result:
+            m["month_total"] = str(m["month_total"])
+        grand_total = sum(Decimal(m["month_total"]) for m in result)
+
+        data = {"year": year, "months": result, "grand_total": str(grand_total)}
+
+        if request.query_params.get("format") == "xlsx":
+            from . import exports
+            return exports.export_monthly_consumption(data)
+
+        return Response(data)
+
+    @action(detail=False, methods=["get"], url_path="supplier-performance")
+    def supplier_performance(self, request):
+        """GET /api/v1/reports/supplier-performance/?date_from=&date_to="""
+        if not rbac.user_has_permission(request.user, "reports.financial"):
+            return Response({"detail": "Permission refusée."}, status=status.HTTP_403_FORBIDDEN)
+
+        date_from_str = request.query_params.get("date_from")
+        date_to_str = request.query_params.get("date_to")
+
+        qs = StockMovement.objects.filter(
+            movement_type=StockMovement.MovementType.ENTREE,
+            status=StockMovement.MovementStatus.COMPLETED,
+            unit_price_at_movement__isnull=False,
+        )
+        if date_from_str:
+            qs = qs.filter(created_at__date__gte=date_from_str)
+        if date_to_str:
+            qs = qs.filter(created_at__date__lte=date_to_str)
+
+        rows = (
+            qs.values("item__supplier_name")
+            .annotate(
+                nb_livraisons=Count("id"),
+                qty_totale=Sum("quantity"),
+                valeur_totale=Sum("total_cost"),
+                prix_moyen=Avg("unit_price_at_movement"),
+                prix_min=Min("unit_price_at_movement"),
+                prix_max=Max("unit_price_at_movement"),
+                derniere_livraison=Max("created_at"),
+            )
+            .order_by("-valeur_totale")
+        )
+
+        data_list = []
+        for row in rows:
+            pmin = row["prix_min"] or Decimal("0")
+            pmax = row["prix_max"] or Decimal("0")
+            data_list.append({
+                "fournisseur": row["item__supplier_name"] or "Inconnu",
+                "nb_livraisons": row["nb_livraisons"],
+                "qty_totale": str(row["qty_totale"] or Decimal("0")),
+                "valeur_totale": str(row["valeur_totale"] or Decimal("0")),
+                "prix_moyen": str(round(row["prix_moyen"] or Decimal("0"), 2)),
+                "prix_min": str(pmin),
+                "prix_max": str(pmax),
+                "ecart_prix": str(pmax - pmin),
+                "derniere_livraison": (
+                    row["derniere_livraison"].date().isoformat()
+                    if row["derniere_livraison"] else None
+                ),
+            })
+
+        result_data = {
+            "suppliers": data_list,
+            "period": {"from": date_from_str, "to": date_to_str},
+        }
+
+        if request.query_params.get("format") == "xlsx":
+            from . import exports
+            return exports.export_supplier_performance(result_data)
+
+        return Response(result_data)
+
+    @action(detail=False, methods=["get"], url_path="budget-vs-actual")
+    def budget_vs_actual(self, request):
+        """GET /api/v1/reports/budget-vs-actual/ — All active projects budget comparison."""
+        if not rbac.user_has_permission(request.user, "reports.budget"):
+            return Response({"detail": "Permission refusée."}, status=status.HTTP_403_FORBIDDEN)
+
+        active_projects = Project.objects.filter(status__in=["planifie", "en_cours"])
+        projects_data = []
+        for project in active_projects:
+            costs = pcosts.compute_project_costs(project)
+            ct = Decimal(costs["cost_total"])
+            bt = Decimal(costs["budget_total"])
+            cv = Decimal(costs["contract_value"]) if costs["contract_value"] else None
+            margin = Decimal(costs["margin"]) if costs["margin"] else None
+            projects_data.append({
+                "name": project.name,
+                "reference": project.reference,
+                "budget_total": str(bt),
+                "cost_total": str(ct),
+                "contract_value": str(cv) if cv else None,
+                "margin": str(margin) if margin else None,
+                "margin_percent": costs["margin_percent"],
+                "over_budget": ct > bt if bt > 0 else False,
+            })
+
+        if request.query_params.get("format") == "xlsx":
+            from . import exports
+            return exports.export_all_projects_budget(projects_data)
+
+        return Response({"projects": projects_data})
+
+    @action(detail=False, methods=["post"], url_path="send-by-email")
+    def send_by_email(self, request):
+        """
+        POST /api/v1/reports/send-by-email/
+        Body: { "report_type": "...", "recipient_email": "...", "params": {...} }
+        """
+        if not rbac.user_has_permission(request.user, "reports.financial"):
+            return Response({"detail": "Permission refusée."}, status=status.HTTP_403_FORBIDDEN)
+
+        report_type = request.data.get("report_type")
+        recipient = request.data.get("recipient_email")
+        params = request.data.get("params", {})
+
+        if not recipient:
+            return Response({"detail": "recipient_email requis."}, status=status.HTTP_400_BAD_REQUEST)
+
+        from . import exports
+        from .mail import send_mail_via_org_settings
+
+        response_xlsx = None
+        filename = ""
+
+        if report_type == "stock_valuation":
+            report_data = _build_stock_valuation_data()
+            cfg = OrganizationSettings.objects.first()
+            currency = cfg.default_currency if cfg and hasattr(cfg, "default_currency") else "XOF"
+            response_xlsx = exports.export_stock_valuation(report_data, currency)
+            filename = f"inventaire-valorise-{date.today()}.xlsx"
+        elif report_type == "monthly_consumption":
+            year = int(params.get("year", date.today().year))
+            qs = StockMovement.objects.filter(
+                movement_type=StockMovement.MovementType.SORTIE,
+                status=StockMovement.MovementStatus.COMPLETED,
+                created_at__year=year,
+            ).select_related("item__category")
+            rows = (
+                qs.values("created_at__month", "item__category__name")
+                .annotate(total_cost=Sum("total_cost"), total_qty=Sum("quantity"))
+                .order_by("created_at__month", "item__category__name")
+            )
+            MONTH_LABELS = [
+                "", "Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
+                "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre",
+            ]
+            months_data: dict[int, dict] = {}
+            for row in rows:
+                m = row["created_at__month"]
+                if m not in months_data:
+                    months_data[m] = {
+                        "month": m, "month_label": MONTH_LABELS[m],
+                        "by_category": [], "month_total": Decimal("0"),
+                    }
+                tc = row["total_cost"] or Decimal("0")
+                months_data[m]["by_category"].append({
+                    "category": row["item__category__name"] or "Sans catégorie",
+                    "total_cost": str(tc),
+                    "total_qty": str(row["total_qty"] or Decimal("0")),
+                })
+                months_data[m]["month_total"] += tc
+            result = sorted(months_data.values(), key=lambda x: x["month"])
+            for m_data in result:
+                m_data["month_total"] = str(m_data["month_total"])
+            grand_total = sum(Decimal(m_data["month_total"]) for m_data in result)
+            data = {"year": year, "months": result, "grand_total": str(grand_total)}
+            response_xlsx = exports.export_monthly_consumption(data)
+            filename = f"consommation-{year}.xlsx"
+        elif report_type == "supplier_performance":
+            date_from_str = params.get("date_from")
+            date_to_str = params.get("date_to")
+            qs = StockMovement.objects.filter(
+                movement_type=StockMovement.MovementType.ENTREE,
+                status=StockMovement.MovementStatus.COMPLETED,
+                unit_price_at_movement__isnull=False,
+            )
+            if date_from_str:
+                qs = qs.filter(created_at__date__gte=date_from_str)
+            if date_to_str:
+                qs = qs.filter(created_at__date__lte=date_to_str)
+            rows = (
+                qs.values("item__supplier_name")
+                .annotate(
+                    nb_livraisons=Count("id"),
+                    qty_totale=Sum("quantity"),
+                    valeur_totale=Sum("total_cost"),
+                    prix_moyen=Avg("unit_price_at_movement"),
+                    prix_min=Min("unit_price_at_movement"),
+                    prix_max=Max("unit_price_at_movement"),
+                    derniere_livraison=Max("created_at"),
+                )
+                .order_by("-valeur_totale")
+            )
+            data_list = []
+            for row in rows:
+                pmin = row["prix_min"] or Decimal("0")
+                pmax = row["prix_max"] or Decimal("0")
+                data_list.append({
+                    "fournisseur": row["item__supplier_name"] or "Inconnu",
+                    "nb_livraisons": row["nb_livraisons"],
+                    "qty_totale": str(row["qty_totale"] or Decimal("0")),
+                    "valeur_totale": str(row["valeur_totale"] or Decimal("0")),
+                    "prix_moyen": str(round(row["prix_moyen"] or Decimal("0"), 2)),
+                    "prix_min": str(pmin),
+                    "prix_max": str(pmax),
+                    "ecart_prix": str(pmax - pmin),
+                    "derniere_livraison": (
+                        row["derniere_livraison"].date().isoformat()
+                        if row["derniere_livraison"] else None
+                    ),
+                })
+            result_data = {"suppliers": data_list, "period": {"from": date_from_str, "to": date_to_str}}
+            response_xlsx = exports.export_supplier_performance(result_data)
+            filename = f"performance-fournisseurs-{date.today()}.xlsx"
+        else:
+            return Response({"detail": f"Type inconnu : {report_type}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if response_xlsx is None:
+            return Response({"detail": "Génération impossible."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        content = response_xlsx.content
+        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+        try:
+            n, kind = send_mail_via_org_settings(
+                subject=f"[Bâtir Pro] Rapport : {report_type}",
+                html_body=(
+                    f"<p>Veuillez trouver en pièce jointe le rapport "
+                    f"<strong>{report_type}</strong> généré le "
+                    f"{date.today().strftime('%d/%m/%Y')}.</p>"
+                ),
+                recipient_list=[recipient],
+                attachments=[(filename, content, mime)],
+            )
+            return Response({"sent": n > 0, "delivery_kind": kind, "recipient": recipient})
+        except Exception:
+            return Response({"sent": False, "delivery_kind": "error", "recipient": recipient})
