@@ -1516,7 +1516,15 @@ class StockMovementViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
         """GET /api/v1/stock-movements/export/?date_from=&date_to=&movement_type=&project="""
         from . import exports
 
-        qs = StockMovement.objects.filter(
+        movement_type = request.query_params.get("movement_type")
+
+        # Enforce reports.site for transfer exports
+        if movement_type == StockMovement.MovementType.TRANSFERT:
+            if not rbac.user_has_permission(request.user, "reports.site") and not rbac.user_has_permission(request.user, "reports.financial"):
+                return Response({"detail": "Permission refusée."}, status=status.HTTP_403_FORBIDDEN)
+
+        # Build scoped queryset using access rules (same as get_queryset but with completed + filters)
+        qs = self.get_queryset().filter(
             status=StockMovement.MovementStatus.COMPLETED,
         ).select_related(
             "item", "item__unit", "item__category",
@@ -1526,7 +1534,6 @@ class StockMovementViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
 
         date_from = request.query_params.get("date_from")
         date_to = request.query_params.get("date_to")
-        movement_type = request.query_params.get("movement_type")
         project_id = request.query_params.get("project")
 
         if date_from:
@@ -2465,9 +2472,21 @@ class ReportViewSet(viewsets.ViewSet):
             months_data[m]["month_total"] += tc
 
         result = sorted(months_data.values(), key=lambda x: x["month"])
+        # Zero-pad all 12 months
+        existing_months = {m["month"] for m in result}
+        for mon in range(1, 13):
+            if mon not in existing_months:
+                result.append({
+                    "month": mon,
+                    "month_label": MONTH_LABELS[mon],
+                    "by_category": [],
+                    "month_total": "0",
+                })
+        result.sort(key=lambda x: x["month"])
         for m in result:
-            m["month_total"] = str(m["month_total"])
-        grand_total = sum(Decimal(m["month_total"]) for m in result)
+            if not isinstance(m["month_total"], str):
+                m["month_total"] = str(m["month_total"])
+        grand_total = sum(Decimal(str(m["month_total"])) for m in result)
 
         data = {"year": year, "months": result, "grand_total": str(grand_total)}
 
@@ -2485,6 +2504,12 @@ class ReportViewSet(viewsets.ViewSet):
 
         date_from_str = request.query_params.get("date_from")
         date_to_str = request.query_params.get("date_to")
+
+        # Default to last 12 months if no dates provided
+        if not date_from_str and not date_to_str:
+            today = date.today()
+            date_from_str = today.replace(year=today.year - 1).isoformat()
+            date_to_str = today.isoformat()
 
         qs = StockMovement.objects.filter(
             movement_type=StockMovement.MovementType.ENTREE,
@@ -2542,13 +2567,17 @@ class ReportViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["get"], url_path="budget-vs-actual")
     def budget_vs_actual(self, request):
-        """GET /api/v1/reports/budget-vs-actual/ — All active projects budget comparison."""
+        """GET /api/v1/reports/budget-vs-actual/?project= — Active projects budget comparison."""
         if not rbac.user_has_permission(request.user, "reports.budget"):
             return Response({"detail": "Permission refusée."}, status=status.HTTP_403_FORBIDDEN)
 
-        active_projects = Project.objects.filter(status__in=["planifie", "en_cours"])
+        qs = Project.objects.filter(status__in=["planifie", "en_cours"])
+        project_id = request.query_params.get("project")
+        if project_id:
+            qs = qs.filter(id=project_id)
+
         projects_data = []
-        for project in active_projects:
+        for project in qs:
             costs = pcosts.compute_project_costs(project)
             ct = Decimal(costs["cost_total"])
             bt = Decimal(costs["budget_total"])

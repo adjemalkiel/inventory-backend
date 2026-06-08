@@ -145,15 +145,25 @@ def export_project_cost_breakdown(project, costs: dict, by_category: list) -> Ht
         ("Location équipements", "cost_rental"),
         ("Frais généraux", "cost_overhead"),
     ]
-    _header_row(ws1, ["Poste", "Coût réalisé", "Devise"], row=3)
+    budget_total = Decimal(str(costs.get("budget_total") or "0"))
+    _header_row(ws1, ["Poste", "Coût réalisé", "Budget", "Écart", "%", "Devise"], row=3)
     ws1.freeze_panes = "A4"
     currency = project.currency or "XOF"
     for r_idx, (label, key) in enumerate(POSTE_MAP, start=4):
         ws1.cell(row=r_idx, column=1, value=label)
-        c = ws1.cell(row=r_idx, column=2, value=float(Decimal(costs.get(key) or "0")))
-        c.number_format = "#,##0.00"
-        c.alignment = Alignment(horizontal="right")
-        ws1.cell(row=r_idx, column=3, value=currency)
+        actual_val = Decimal(costs.get(key) or "0")
+        line_budget = budget_total / Decimal(len(POSTE_MAP)) if budget_total > 0 else Decimal("0")
+        ecart = line_budget - actual_val
+        pct = round(float(ecart) / float(line_budget) * 100, 1) if line_budget > 0 else None
+
+        c = ws1.cell(row=r_idx, column=2, value=float(actual_val))
+        c.number_format = "#,##0.00"; c.alignment = Alignment(horizontal="right")
+        c = ws1.cell(row=r_idx, column=3, value=float(line_budget))
+        c.number_format = "#,##0.00"; c.alignment = Alignment(horizontal="right")
+        c = ws1.cell(row=r_idx, column=4, value=float(ecart))
+        c.number_format = "#,##0.00"; c.alignment = Alignment(horizontal="right")
+        ws1.cell(row=r_idx, column=5, value=f"{pct:.1f}%" if pct is not None else "—")
+        ws1.cell(row=r_idx, column=6, value=currency)
     total_r = len(POSTE_MAP) + 4
     _total_row(ws1, total_r, "COÛT TOTAL", {2: Decimal(str(costs.get("cost_total") or 0))})
     meta_r = total_r + 2
