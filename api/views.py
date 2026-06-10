@@ -38,6 +38,7 @@ from .models import (
     Agency,
     Alert,
     ApprovalRule,
+    ApprovalThreshold,
     Category,
     Integration,
     Item,
@@ -61,6 +62,8 @@ from .models import (
     UserProfile,
     UserRole,
 )
+from rest_framework.permissions import SAFE_METHODS
+from rest_framework.exceptions import PermissionDenied
 from . import valuation
 from . import alert_engine
 from .mail import (
@@ -79,6 +82,7 @@ from .serializers import (
     AgencySerializer,
     AlertSerializer,
     ApprovalRuleSerializer,
+    ApprovalThresholdSerializer,
     CategorySerializer,
     ChangePasswordSerializer,
     IntegrationSerializer,
@@ -355,6 +359,13 @@ class SiteViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     queryset = Site.objects.all()
     serializer_class = SiteSerializer
 
+    def get_permissions(self):
+        perms = super().get_permissions()
+        if self.request.method not in SAFE_METHODS:
+            if not rbac.user_has_permission(self.request.user, "settings.manage"):
+                raise PermissionDenied("Modification réservée aux administrateurs.")
+        return perms
+
 
 class UserViewSet(viewsets.ModelViewSet):
     """
@@ -558,6 +569,13 @@ class AgencyViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     queryset = Agency.objects.all()
     serializer_class = AgencySerializer
 
+    def get_permissions(self):
+        perms = super().get_permissions()
+        if self.request.method not in SAFE_METHODS:
+            if not rbac.user_has_permission(self.request.user, "settings.manage"):
+                raise PermissionDenied("Modification réservée aux administrateurs.")
+        return perms
+
     def get_queryset(self):
         qs = super().get_queryset()
         u = self.request.user
@@ -743,17 +761,38 @@ class UnitOfMeasureViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     queryset = UnitOfMeasure.objects.all()
     serializer_class = UnitOfMeasureSerializer
 
+    def get_permissions(self):
+        perms = super().get_permissions()
+        if self.request.method not in SAFE_METHODS:
+            if not rbac.user_has_permission(self.request.user, "settings.manage"):
+                raise PermissionDenied("Modification réservée aux administrateurs.")
+        return perms
+
 
 class CategoryViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, access.ItemCatalogAccess]
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
 
+    def get_permissions(self):
+        perms = super().get_permissions()
+        if self.request.method not in SAFE_METHODS:
+            if not rbac.user_has_permission(self.request.user, "settings.manage"):
+                raise PermissionDenied("Modification réservée aux administrateurs.")
+        return perms
+
 
 class SupplierViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, access.ItemCatalogAccess]
     queryset = Supplier.objects.filter(is_active=True)
     serializer_class = SupplierSerializer
+
+    def get_permissions(self):
+        perms = super().get_permissions()
+        if self.request.method not in SAFE_METHODS:
+            if not rbac.user_has_permission(self.request.user, "settings.manage"):
+                raise PermissionDenied("Modification réservée aux administrateurs.")
+        return perms
 
 
 class UserProfileViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
@@ -1606,6 +1645,24 @@ class ApprovalRuleViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     ordering = ["movement_type", "min_value_threshold"]
 
 
+class ApprovalThresholdViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
+    """
+    CRUD des seuils d'approbation.
+    Accessible uniquement aux administrateurs (permission settings.manage).
+    """
+    serializer_class = ApprovalThresholdSerializer
+    permission_classes = [IsAuthenticated]
+    queryset = ApprovalThreshold.objects.all()
+    ordering = ["order", "min_amount"]
+
+    def get_permissions(self):
+        perms = super().get_permissions()
+        if self.request.method not in SAFE_METHODS:
+            if not rbac.user_has_permission(self.request.user, "settings.manage"):
+                raise PermissionDenied("Modification réservée aux administrateurs.")
+        return perms
+
+
 class ItemProjectAssignmentViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, access.AgencyProjectScopeAccess]
     queryset = ItemProjectAssignment.objects.select_related(
@@ -1839,6 +1896,7 @@ class OrganizationSettingsViewSet(SetAuditUsersMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, access.SettingsIntegrationAccess]
     queryset = OrganizationSettings.objects.all()
     serializer_class = OrganizationSettingsSerializer
+    parser_classes = [JSONParser, MultiPartParser]
 
     @action(detail=True, methods=["post"], url_path="test-smtp")
     def test_smtp(self, request, pk=None):
@@ -2735,3 +2793,103 @@ class ReportViewSet(viewsets.ViewSet):
             return Response({"sent": n > 0, "delivery_kind": kind, "recipient": recipient})
         except Exception:
             return Response({"sent": False, "delivery_kind": "error", "recipient": recipient})
+
+
+# ─── Section 10.4.4 — Journal d'activité agrégé ──────────────────────────
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def activity_log(request):
+    """
+    GET /api/v1/activity-log/?limit=100&type=movement|project|item|user
+    Retourne les dernières actions sur les objets clés de l'application.
+    Exploite les champs AuditedModel : created_by, updated_by, created_at.
+    """
+    if not rbac.user_has_permission(request.user, "settings.manage") \
+       and not rbac.user_has_permission(request.user, "reports.financial"):
+        return Response({"detail": "Accès refusé."}, status=403)
+
+    limit = min(int(request.query_params.get("limit", 100)), 500)
+    filter_type = request.query_params.get("type", "")
+
+    events = []
+
+    def _user_label(user):
+        if user is None:
+            return "Système"
+        try:
+            return user.get_full_name() or user.username
+        except Exception:
+            return "—"
+
+    # ─── Mouvements récents ─────────────────────────────────────────────
+    if not filter_type or filter_type == "movement":
+        for mv in (StockMovement.objects
+                   .select_related("created_by", "item", "project")
+                   .order_by("-created_at")[:limit]):
+            events.append({
+                "type": "movement",
+                "action": "create",
+                "label": f"Mouvement {mv.get_movement_type_display()} — {mv.item.name}",
+                "detail": f"Qté : {mv.quantity:g} | Statut : {mv.get_status_display()}"
+                          + (f" | Chantier : {mv.project.name}" if mv.project else ""),
+                "ref": str(mv.reference_number or mv.id),
+                "object_id": str(mv.id),
+                "actor": _user_label(mv.created_by),
+                "timestamp": mv.created_at.isoformat(),
+            })
+
+    # ─── Articles créés/modifiés ─────────────────────────────────────────
+    if not filter_type or filter_type == "item":
+        for item in (Item.objects
+                     .select_related("created_by", "updated_by")
+                     .order_by("-updated_at")[:limit // 2]):
+            events.append({
+                "type": "item",
+                "action": "update" if item.updated_by else "create",
+                "label": f"Article — {item.name}",
+                "detail": f"SKU : {item.sku}",
+                "ref": item.sku,
+                "object_id": str(item.id),
+                "actor": _user_label(item.updated_by or item.created_by),
+                "timestamp": item.updated_at.isoformat(),
+            })
+
+    # ─── Projets créés/modifiés ──────────────────────────────────────────
+    if not filter_type or filter_type == "project":
+        for project in (Project.objects
+                        .select_related("created_by", "updated_by")
+                        .order_by("-updated_at")[:limit // 4]):
+            events.append({
+                "type": "project",
+                "action": "update" if project.updated_by else "create",
+                "label": f"Chantier — {project.name}",
+                "detail": f"Statut : {project.get_status_display()}",
+                "ref": project.reference or str(project.id),
+                "object_id": str(project.id),
+                "actor": _user_label(project.updated_by or project.created_by),
+                "timestamp": project.updated_at.isoformat(),
+            })
+
+    # ─── Utilisateurs invités ────────────────────────────────────────────
+    if not filter_type or filter_type == "user":
+        for profile in (UserProfile.objects
+                        .select_related("created_by", "user")
+                        .order_by("-created_at")[:limit // 4]):
+            events.append({
+                "type": "user",
+                "action": "invite",
+                "label": f"Utilisateur — {profile.user.get_full_name() or profile.user.username}",
+                "detail": f"Email : {profile.user.email}",
+                "ref": profile.user.username,
+                "object_id": str(profile.id),
+                "actor": _user_label(profile.created_by),
+                "timestamp": profile.created_at.isoformat(),
+            })
+
+    # Trier par timestamp décroissant et tronquer
+    events.sort(key=lambda e: e["timestamp"], reverse=True)
+    return Response({
+        "count": len(events[:limit]),
+        "results": events[:limit],
+    })

@@ -52,10 +52,14 @@ router.register(
     views.StockMovementViewSet,
     basename="stock-movement",
 )
-router.register(
-    r"approval-rules",
+router.register(r"approval-rules",
     views.ApprovalRuleViewSet,
     basename="approval-rule",
+)
+router.register(
+    r"approval-thresholds",
+    views.ApprovalThresholdViewSet,
+    basename="approval-threshold",
 )
 router.register(
     r"item-project-assignments",
@@ -125,4 +129,5 @@ urlpatterns = [
         dashboard_views.dashboard_cost_overview,
         name="dashboard-cost-overview",
     ),
+    path("activity-log/", views.activity_log, name="activity-log"),
 ] + router.urls

@@ -69,10 +69,18 @@ def _autofit_columns(ws, min_width: int = 12, max_width: int = 40):
         ws.column_dimensions[col_letter].width = min(max(max_len + 2, min_width), max_width)
 
 
-def _title_block(ws, title: str, subtitle: str = ""):
-    ws.cell(row=1, column=1, value=title).font = Font(bold=True, size=13, color=PRIMARY)
+def _title_block(ws, title: str, subtitle: str = "", org=None):
+    row = 1
+    if org is not None:
+        org_name = org.company_name or "Bâtir Pro"
+        ws.cell(row=row, column=1, value=org_name).font = Font(bold=True, size=11, color=PRIMARY)
+        row += 1
+        if org.company_city:
+            ws.cell(row=row, column=1, value=org.company_city).font = Font(italic=True, size=9, color="6B7280")
+            row += 1
+    ws.cell(row=row, column=1, value=title).font = Font(bold=True, size=13, color=PRIMARY)
     if subtitle:
-        ws.cell(row=2, column=1, value=subtitle).font = Font(italic=True, size=9, color="6B7280")
+        ws.cell(row=row + 1, column=1, value=subtitle).font = Font(italic=True, size=9, color="6B7280")
 
 
 def _finalize_xlsx(wb: Workbook, response: HttpResponse) -> HttpResponse:

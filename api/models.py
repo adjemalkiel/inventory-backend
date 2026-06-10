@@ -121,6 +121,12 @@ class StorageLocation(AuditedModel):
 
 class UnitOfMeasure(AuditedModel):
     name = models.CharField(max_length=64, unique=True)
+    symbol = models.CharField(
+        max_length=16, blank=True, default="",
+        help_text="Symbole court (ex : kg, m³, ml). Affiché dans les tableaux."
+    )
+    description = models.CharField(max_length=255, blank=True, default="")
+    is_active = models.BooleanField(default=True)
 
     class Meta:
         ordering = ["name"]
@@ -723,6 +729,55 @@ class ApprovalRule(AuditedModel):
         return f"Règle {self.movement_type} ≥ {self.min_value_threshold}"
 
 
+class ApprovalThreshold(AuditedModel):
+    """
+    Seuil de validation configurable par l'admin.
+    Définit quel rôle est requis pour approuver un mouvement selon son type et sa valeur.
+    Les règles sont évaluées dans l'ordre (order ASC). La première règle correspondante s'applique.
+    """
+
+    class MovementScope(models.TextChoices):
+        ALL          = "all",        "Tous les types"
+        SORTIE       = "sortie",     "Sortie vers chantier"
+        TRANSFERT    = "transfert",  "Transfert inter-sites"
+        AJUSTEMENT   = "ajustement", "Ajustement / perte"
+
+    label = models.CharField(
+        max_length=255,
+        help_text="Libellé de la règle (ex : 'Sortie < 100 000 XOF — chef chantier')"
+    )
+    movement_scope = models.CharField(
+        max_length=32,
+        choices=MovementScope.choices,
+        default=MovementScope.ALL,
+    )
+    min_amount = models.DecimalField(
+        max_digits=14, decimal_places=2, null=True, blank=True,
+        help_text="Montant minimum (inclus) pour que cette règle s'applique. Vide = 0."
+    )
+    max_amount = models.DecimalField(
+        max_digits=14, decimal_places=2, null=True, blank=True,
+        help_text="Montant maximum (exclus) pour que cette règle s'applique. Vide = illimité."
+    )
+    required_role_code = models.CharField(
+        max_length=64,
+        help_text="Code du rôle requis pour valider (ex : 'chef_chantier', 'conducteur_travaux', 'administrateur')."
+    )
+    is_active = models.BooleanField(default=True)
+    order = models.PositiveSmallIntegerField(
+        default=0,
+        help_text="Ordre d'évaluation (ASC). La première règle correspondante s'applique."
+    )
+
+    class Meta:
+        ordering = ["order", "min_amount"]
+        verbose_name = "Seuil d'approbation"
+        verbose_name_plural = "Seuils d'approbation"
+
+    def __str__(self) -> str:
+        return self.label
+
+
 class ItemProjectAssignment(AuditedModel):
     item = models.ForeignKey(
         Item,
@@ -842,6 +897,25 @@ class OrganizationSettings(AuditedModel):
         help_text="Adresse d’expéditeur pour l’e-mail (sinon paramètre par défaut du serveur).",
     )
 
+    # ─── Profil entreprise ──────────────────────────────────────────────────────
+    company_name = models.CharField(
+        max_length=255, blank=True, default="",
+        help_text="Nom légal de l'entreprise (affiché sur les exports et les emails)."
+    )
+    company_logo = models.ImageField(
+        upload_to="logos/", null=True, blank=True,
+        help_text="Logo de l'entreprise (PNG/JPG, max 2 Mo, ratio paysage recommandé)."
+    )
+    company_address = models.CharField(max_length=512, blank=True, default="")
+    company_city = models.CharField(max_length=128, blank=True, default="")
+    company_country = models.CharField(max_length=128, blank=True, default="")
+    company_phone = models.CharField(max_length=64, blank=True, default="")
+    company_email = models.EmailField(blank=True, default="")
+    company_website = models.URLField(blank=True, default="")
+    company_tax_id = models.CharField(
+        max_length=128, blank=True, default="",
+        help_text="Numéro d'identification fiscale / RCCM."
+    )
 
     # Alertes -- canaux
     email_alerts_enabled = models.BooleanField(default=True,

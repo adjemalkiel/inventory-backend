@@ -11,6 +11,7 @@ from .models import (
     Agency,
     Alert,
     ApprovalRule,
+    ApprovalThreshold,
     Category,
     Integration,
     Item,
@@ -1150,6 +1151,20 @@ class ApprovalRuleSerializer(serializers.ModelSerializer):
             "approver_role_code",
         ]
         read_only_fields = AUDITED_READ_ONLY
+
+
+class ApprovalThresholdSerializer(serializers.ModelSerializer):
+    movement_scope_label = serializers.CharField(
+        source="get_movement_scope_display", read_only=True)
+
+    class Meta:
+        model = ApprovalThreshold
+        fields = [
+            "id", "label", "movement_scope", "movement_scope_label",
+            "min_amount", "max_amount", "required_role_code",
+            "is_active", "order", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
 
 
 class ItemProjectAssignmentSerializer(serializers.ModelSerializer):
